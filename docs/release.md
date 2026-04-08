@@ -1,9 +1,100 @@
 # Release notes
 
-Current version is phy v2.0b1 (beta 1) (7 Feb 2020).
+Current version is phy v2.1.0rc1 (release candidate 1) (11 Mar 2026).
 
+## phy 2.1.0rc1
 
-## New views
+With substantial help from AI-assisted development, it has been possible to put time and effort into this maintenance release for the current 2.x line.
+
+`phy 2.1.0rc1` is focused on making the existing software work better for users. It is not meant to bring in major new features or feature requests at this stage. More work will likely still be needed based on user feedback during the release candidate period.
+
+### Main points
+
+* No changes to the dataset or file formats
+* Dependency updates and packaging cleanup
+* Replacement of a fragile legacy web-based GUI component with a Qt-native implementation
+* Expected improvement on systems where the old embedded web component caused blank panes, white windows, or related display failures
+
+### How to install this RC
+
+Use a fresh Python 3.10+ environment and install the exact release-candidate version.
+
+On Linux or macOS:
+
+```bash
+python3 -m venv phy-2.1.0rc1
+source phy-2.1.0rc1/bin/activate
+python -m pip install --upgrade pip
+pip install "phy==2.1.0rc1"
+phy --version
+```
+
+On Windows PowerShell:
+
+```powershell
+py -3.10 -m venv phy-2.1.0rc1
+.\phy-2.1.0rc1\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install "phy==2.1.0rc1"
+phy --version
+```
+
+If you are testing on a template-based spike-sorting output containing `params.py`, a minimal startup check is:
+
+```bash
+phy template-describe params.py
+phy template-gui params.py
+```
+
+If you use the legacy Kwik workflow:
+
+```bash
+pip install klusta klustakwik2
+phy kwik-gui path/to/file.kwik
+```
+
+### What to test
+
+* Installation on current Linux, macOS and Windows environments
+* GUI startup and rendering behavior
+* Cluster selection and view updates
+* Feature, waveform, amplitude, and trace views
+* Remote desktop, Wayland, and GPU-specific setups
+* Plugin-based workflows
+
+### Compatibility notes
+
+* Dataset formats are unchanged
+* Some plugins relying on internal HTML or other web-based GUI components may need updates
+
+### Notes for plugin maintainers
+
+The main compatibility risk for plugins is on the GUI side. The legacy web-based component has been replaced with a Qt-native implementation, so plugins depending on internal HTML or other web-based GUI pieces may need to be updated.
+
+Plugins using supported Python-side controller, event, or view APIs are more likely to keep working unchanged, but they should still be tested.
+
+### Testing window
+
+Testing for `2.1.0rc1` is expected to stay open for at least the next couple of months before a final `2.1.0` release.
+
+### Feedback
+
+When reporting issues, please include:
+
+* operating system
+* Python version
+* installation method
+* local or remote session details
+* whether plugins are in use
+* a minimal error message or reproduction if possible
+
+## Historical notes for older releases
+
+The notes below are kept for reference only and concern older releases, not the current `2.1.0rc1` release candidate.
+
+### phy 2.0 beta 1 (2020-02)
+
+#### New views
 
 * **Cluster scatter view**: a scatter plot of all clusters, on two user-defined dimensions (for example, depth vs firing rate). The marker size and colors can also depend on two additional user-defined dimensions.
 
@@ -32,25 +123,22 @@ Current version is phy v2.0b1 (beta 1) (7 Feb 2020).
 
     <img src="https://user-images.githubusercontent.com/1942359/74029179-696a5400-49ac-11ea-8b55-71cf864391aa.png" style="width: 400px;">
 
-
 * Improved **Amplitude view**: different types of spike amplitudes as a function of time, with histograms.
 
     <img src="https://user-images.githubusercontent.com/1942359/74029349-c6fea080-49ac-11ea-9723-3f432023ee4b.png" style="width: 400px;">
-
 
 * **IPython view**: interact with the GUI and the data programmatically.
 
     <img src="https://user-images.githubusercontent.com/1942359/74029254-90c12100-49ac-11ea-8b8e-a4997910ffe5.png" style="width: 400px;">
 
-
-## New features
+#### New features
 
 * **Split clusters in the amplitude view or in the template feature view**, in addition to the feature view
 * **Cluster view**:
     * Dynamically **filter** the list of clusters based on cluster metrics and labels (using JavaScript syntax)
     * Snippets to quickly **sort and filter** clusters
     * New default columns: mean firing rate, and template waveform amplitude
-    * The styling can be customized with CSS in a plugin (see plugin examples in the documentation)
+    * The styling can be customized in a plugin (see plugin examples in the documentation)
 * **Amplitude view**:
     * Show an histogram of amplitudes overlaid with the amplitudes
     * Support for multiple types of amplitudes (template waveform amplitude, raw waveform amplitude, feature amplitude)
@@ -87,8 +175,7 @@ Current version is phy v2.0b1 (beta 1) (7 Feb 2020).
     * Support **multiple raw data files** (virtually concatenated)
     * Support for **multiple channel shanks**: add a `channel_shanks.npy` file with shape `(n_channels,` ), with the shank integer index of every channel.
 
-
-## Improvements
+#### Improvements
 
 * A new file `cluster_info.tsv` is automatically saved, containing all information from the cluster view.
 * Minimal high-level data access API in the Template Model
@@ -102,8 +189,7 @@ Current version is phy v2.0b1 (beta 1) (7 Feb 2020).
 * New `plugins/` folder in the repository, with many plugin examples
 * Documentation rewritten from scratch, with many examples
 
-
-## Internal changes
+#### Internal changes
 
 * Support **Python 3.7+**, dropped Python 2.x support (reached End Of Life)
 * Updated to **PyQt5** from PyQt4, which is now unsupported
@@ -112,16 +198,9 @@ Current version is phy v2.0b1 (beta 1) (7 Feb 2020).
 * Created **phylib**, a small dependency with I/O code and non-graphical utilities, also used by ibllib
 * Moved the phy GitHub repository from kwikteam to cortex-lab organization
 
-
-## Notes for plugin maintainers
+#### Notes for plugin maintainers
 
 The following changes may affect phy plugins:
 
 * The `add_view` and `view_actions_created` events have been removed.
 * You should now use the new event `view_attached(view, gui)` that is emitted when a view is attached to the GUI.
-
-
-## [coming soon] Upcoming features
-
-* Support for events: PSTH view, trial-based raster plots, etc.
-* More efficient GPU-based plotting

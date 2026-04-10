@@ -26,13 +26,14 @@ Keyboard shortcuts (when cluster table has focus or anywhere):
 from __future__ import annotations
 
 import logging
+import threading
 from collections import OrderedDict
 from typing import Sequence
 
 import numpy as np
 
 from PyQt6.QtCore import (
-    Qt, QThread, QObject, QSortFilterProxyModel,
+    Qt, QObject,
     QAbstractTableModel, QModelIndex, QItemSelectionModel,
     pyqtSignal, pyqtSlot,
 )
@@ -45,6 +46,8 @@ from PyQt6.QtWidgets import (
 
 from phy_remote.client.transport import PhyTransport, TransportError
 from phy_remote.client.views.waveform_view import WaveformWidget
+from phy_remote.client.views.isi_view import ISIWidget
+from phy_remote.client.views.amplitude_view import AmplitudeWidget
 
 logger = logging.getLogger(__name__)
 
@@ -264,20 +267,14 @@ class _LRUCache:
 
 class _FetchWorker(QObject):
     """
-    Fetches waveforms for selected clusters in two stages:
-      1. Templates (instant) — emitted via template_ready so the view
-         can show something immediately.
-      2. Real spike waveforms on template channels — emitted via finished
-         once extraction completes.
-
-    Takes the existing PhyTransport rather than creating a new one — the
-    ZMQ REQ socket is used from the worker thread, which is safe because
-    the main thread only touches it for label_cluster() (user-triggered,
-    never concurrent with a fetch).
+    Fetches waveforms in two stages using a plain Python thread.
+    PyQt6 queues cross-thread signal emissions to the main event loop
+    automatically, so no QThread / moveToThread needed.
     """
-    template_ready = pyqtSignal(dict)   # {cluster_id: ndarray (n_samples, n_channels)}
-    finished       = pyqtSignal(dict)   # {cluster_id: ndarray (n_spikes, n_samples, n_channels)}
-    error          = pyqtSignal(str)
+    template_ready   = pyqtSignal(dict)   # {cid: (n_samples, n_channels)}
+    spike_data_ready = pyqtSignal(dict)   # {cid: (n_spikes, 2) [time, amp]}
+    finished         = pyqtSignal(dict)   # {cid: (n_spikes, n_samples, n_channels)}
+    error            = pyqtSignal(str)
 
     def __init__(
         self,
@@ -291,31 +288,63 @@ class _FetchWorker(QObject):
         self.cluster_ids = cluster_ids
         self.n_spikes = n_spikes
         self.skip_templates = skip_templates
+        self._cancelled = False
 
-    @pyqtSlot()
+    def cancel(self) -> None:
+        self._cancelled = True
+
     def run(self):
+        print(f"[FetchWorker] run() start clusters={self.cluster_ids}", flush=True)
         if not self.skip_templates:
-            # Stage 1: templates (fast — pre-computed, served from RAM)
             templates = {}
             for cid in self.cluster_ids:
+                if self._cancelled:
+                    return
                 try:
+                    print(f"[FetchWorker] get_templates({cid}) …", flush=True)
                     _, tmpl = self.transport.get_templates(cid)
+                    print(f"[FetchWorker] got template shape={tmpl.shape}", flush=True)
                     templates[cid] = tmpl
                 except Exception as exc:
+                    print(f"[FetchWorker] ERROR templates: {exc}", flush=True)
                     self.error.emit(f"Template fetch failed for cluster {cid}: {exc}")
                     return
-            self.template_ready.emit(templates)
+            if not self._cancelled:
+                print(f"[FetchWorker] emitting template_ready", flush=True)
+                self.template_ready.emit(templates)
 
-        # Stage 2: real waveforms restricted to template channels (slower)
+        # Stage 2: spike times + amplitudes (fast — all in RAM)
+        spike_data = {}
+        for cid in self.cluster_ids:
+            if self._cancelled:
+                return
+            try:
+                spike_data[cid] = self.transport.get_spike_data(cid)
+            except Exception as exc:
+                print(f"[FetchWorker] ERROR spike_data: {exc}", flush=True)
+                self.error.emit(f"Spike data fetch failed for cluster {cid}: {exc}")
+                return
+        if not self._cancelled:
+            print(f"[FetchWorker] emitting spike_data_ready", flush=True)
+            self.spike_data_ready.emit(spike_data)
+
+        # Stage 3: real waveforms (slow — disk read)
         waveforms = {}
         for cid in self.cluster_ids:
+            if self._cancelled:
+                return
             try:
+                print(f"[FetchWorker] get_waveforms({cid}) …", flush=True)
                 _, w = self.transport.get_waveforms(cid, self.n_spikes)
+                print(f"[FetchWorker] got waveforms shape={w.shape}", flush=True)
                 waveforms[cid] = w
             except Exception as exc:
+                print(f"[FetchWorker] ERROR waveforms: {exc}", flush=True)
                 self.error.emit(f"Waveform fetch failed for cluster {cid}: {exc}")
                 return
-        self.finished.emit(waveforms)
+        if not self._cancelled:
+            print(f"[FetchWorker] emitting finished", flush=True)
+            self.finished.emit(waveforms)
 
 
 class _PrefetchWorker(QObject):
@@ -337,7 +366,6 @@ class _PrefetchWorker(QObject):
     def cancel(self) -> None:
         self._cancelled = True
 
-    @pyqtSlot()
     def run(self):
         try:
             transport = PhyTransport(host=self._host, port=self._port)
@@ -376,8 +404,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.transport = transport
         self.n_spikes = n_spikes
-        self._fetch_thread: QThread | None = None
-        self._prefetch_thread: QThread | None = None
+        self._fetch_worker:    _FetchWorker    | None = None
         self._prefetch_worker: _PrefetchWorker | None = None
 
         # Caches: templates are cheap (fast to fetch, ~KB each),
@@ -398,6 +425,19 @@ class MainWindow(QMainWindow):
         self._cluster_dock.clusters_selected.connect(self._on_clusters_selected)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._cluster_dock)
 
+        # Bottom docks — ISI and Amplitude
+        self._isi_dock = QDockWidget("ISI", self)
+        self._isi_view = ISIWidget(self)
+        self._isi_dock.setWidget(self._isi_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._isi_dock)
+
+        self._amp_dock = QDockWidget("Amplitude", self)
+        self._amp_view = AmplitudeWidget(self)
+        self._amp_dock.setWidget(self._amp_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._amp_dock)
+        self.tabifyDockWidget(self._isi_dock, self._amp_dock)
+        self._isi_dock.raise_()
+
         # Status bar + label buttons
         self._status_label = QLabel("Connecting…")
         status_bar = QStatusBar()
@@ -408,6 +448,8 @@ class MainWindow(QMainWindow):
         # Menu
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self._cluster_dock.toggleViewAction())
+        view_menu.addAction(self._isi_dock.toggleViewAction())
+        view_menu.addAction(self._amp_dock.toggleViewAction())
 
         # Keyboard shortcuts — labelling
         self._add_label_shortcut("g", "good")
@@ -486,19 +528,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_clusters_selected(self, cluster_ids: list[int]) -> None:
+        print(f"[MainWindow] _on_clusters_selected {cluster_ids}", flush=True)
         self._current_cluster_ids = cluster_ids
 
-        # Cancel any in-flight prefetch
+        # Cancel any in-flight workers (they check _cancelled before emitting)
         if self._prefetch_worker is not None:
             self._prefetch_worker.cancel()
-        if self._prefetch_thread and self._prefetch_thread.isRunning():
-            self._prefetch_thread.quit()
-            self._prefetch_thread.wait(100)
-
-        # Cancel in-flight main fetch
-        if self._fetch_thread and self._fetch_thread.isRunning():
-            self._fetch_thread.quit()
-            self._fetch_thread.wait(300)
+        if self._fetch_worker is not None:
+            self._fetch_worker.cancel()
 
         # --- Check template cache ---
         cached_templates = {
@@ -534,23 +571,19 @@ class MainWindow(QMainWindow):
         self._start_fetch(cluster_ids, skip_templates=False)
 
     def _start_fetch(self, cluster_ids: list[int], skip_templates: bool) -> None:
+        print(f"[MainWindow] _start_fetch {cluster_ids} skip={skip_templates}", flush=True)
         worker = _FetchWorker(
-            self.transport,
-            cluster_ids, self.n_spikes,
+            self.transport, cluster_ids, self.n_spikes,
             skip_templates=skip_templates,
         )
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         if not skip_templates:
             worker.template_ready.connect(self._on_templates_ready)
+        worker.spike_data_ready.connect(self._on_spike_data_ready)
         worker.finished.connect(self._on_waveforms_ready)
-        worker.finished.connect(thread.quit)
         worker.error.connect(self._on_fetch_error)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        self._fetch_thread = thread
-        thread.start()
+        self._fetch_worker = worker
+        threading.Thread(target=worker.run, daemon=True).start()
+        print(f"[MainWindow] fetch thread started", flush=True)
 
     def _start_prefetch(self, current_ids: list[int]) -> None:
         """Silently warm the template cache for adjacent clusters."""
@@ -560,15 +593,9 @@ class MainWindow(QMainWindow):
             return
 
         worker = _PrefetchWorker(self.transport.host, self.transport.port, to_fetch)
-        self._prefetch_worker = worker
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         worker.template_ready.connect(self._on_prefetch_template)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        self._prefetch_thread = thread
-        thread.start()
+        self._prefetch_worker = worker
+        threading.Thread(target=worker.run, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Signal handlers
@@ -576,6 +603,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_templates_ready(self, templates: dict) -> None:
+        print(f"[MainWindow] _on_templates_ready clusters={list(templates.keys())}", flush=True)
         logger.info("Templates ready for clusters %s", list(templates.keys()))
         for cid, tmpl in templates.items():
             self._template_cache.put(cid, tmpl)
@@ -589,6 +617,13 @@ class MainWindow(QMainWindow):
             logger.info(
                 "Templates discarded (selection changed to %s)", self._current_cluster_ids
             )
+
+    @pyqtSlot(dict)
+    def _on_spike_data_ready(self, spike_data: dict) -> None:
+        logger.info("Spike data ready for clusters %s", list(spike_data.keys()))
+        if set(spike_data.keys()) == set(self._current_cluster_ids):
+            self._isi_view.set_spike_data(spike_data)
+            self._amp_view.set_spike_data(spike_data)
 
     @pyqtSlot(dict)
     def _on_waveforms_ready(self, waveforms: dict) -> None:
@@ -643,12 +678,8 @@ class MainWindow(QMainWindow):
         self._status_label.setText(text)
 
     def closeEvent(self, event) -> None:
+        if self._fetch_worker is not None:
+            self._fetch_worker.cancel()
         if self._prefetch_worker is not None:
             self._prefetch_worker.cancel()
-        if self._fetch_thread and self._fetch_thread.isRunning():
-            self._fetch_thread.quit()
-            self._fetch_thread.wait(1000)
-        if self._prefetch_thread and self._prefetch_thread.isRunning():
-            self._prefetch_thread.quit()
-            self._prefetch_thread.wait(500)
         super().closeEvent(event)

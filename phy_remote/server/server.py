@@ -30,6 +30,7 @@ from phy_remote.shared.protocol import (
     CMD_GET_CLUSTER_IDS,
     CMD_GET_CLUSTER_INFO,
     CMD_LABEL_CLUSTER,
+    CMD_GET_SPIKE_DATA,
     decode_request,
     encode_response,
 )
@@ -146,6 +147,7 @@ class PhyServer:
             CMD_GET_CLUSTER_IDS: self._handle_get_cluster_ids,
             CMD_GET_CLUSTER_INFO: self._handle_get_cluster_info,
             CMD_LABEL_CLUSTER: self._handle_label_cluster,
+            CMD_GET_SPIKE_DATA: self._handle_get_spike_data,
         }.get(cmd)
 
         if handler is None:
@@ -299,6 +301,28 @@ class PhyServer:
             })
 
         return encode_response(clusters=clusters)
+
+    def _handle_get_spike_data(self, req: dict) -> list[bytes]:
+        """
+        Return per-spike times (s) and amplitudes for a cluster.
+
+        Response array shape: (n_spikes, 2), float64
+          column 0 = spike time in seconds
+          column 1 = spike amplitude (arbitrary units from model.amplitudes,
+                     or 0 if amplitudes are unavailable)
+        """
+        self._require_model()
+        cluster_id = int(req["cluster_id"])
+        spike_ids = self.model.get_cluster_spikes(cluster_id)
+        times = np.asarray(self.model.spike_times[spike_ids], dtype=np.float64)
+
+        if hasattr(self.model, 'amplitudes') and self.model.amplitudes is not None:
+            amps = np.asarray(self.model.amplitudes[spike_ids], dtype=np.float64)
+        else:
+            amps = np.zeros(len(spike_ids), dtype=np.float64)
+
+        data = np.column_stack([times, amps])   # (n_spikes, 2)
+        return encode_response(array=data, cluster_id=cluster_id)
 
     def _handle_label_cluster(self, req: dict) -> list[bytes]:
         """

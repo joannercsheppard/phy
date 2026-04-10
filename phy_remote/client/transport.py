@@ -30,6 +30,7 @@ from phy_remote.shared.protocol import (
     CMD_GET_CLUSTER_IDS,
     CMD_GET_CLUSTER_INFO,
     CMD_LABEL_CLUSTER,
+    CMD_GET_SPIKE_DATA,
     encode_request,
     decode_response,
 )
@@ -178,6 +179,21 @@ class PhyTransport:
         """
         header, _ = self._call(CMD_GET_CLUSTER_INFO)
         return header["clusters"]
+
+    def get_spike_data(self, cluster_id: int) -> np.ndarray:
+        """
+        Fetch per-spike times and amplitudes for *cluster_id*.
+
+        Returns
+        -------
+        data : np.ndarray, shape (n_spikes, 2), float64
+            column 0 = spike time (seconds)
+            column 1 = spike amplitude
+        """
+        _, array = self._call(CMD_GET_SPIKE_DATA, cluster_id=cluster_id)
+        if array is None:
+            raise TransportError("server sent no array for get_spike_data")
+        return array
 
     def label_cluster(
         self, cluster_ids: "int | list[int]", label: str

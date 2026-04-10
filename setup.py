@@ -59,8 +59,8 @@ setup(
     author='Cyrille Rossant (cortex-lab/UCL/IBL)',
     author_email='cyrille.rossant+pypi@gmail.com',
     url='https://phy.cortexlab.net',
-    packages=_package_tree('phy'),
-    package_dir={'phy': 'phy'},
+    packages=_package_tree('phy') + _package_tree('phy_remote'),
+    package_dir={'phy': 'phy', 'phy_remote': 'phy_remote'},
     package_data={
         'phy': ['*.vert', '*.frag', '*.glsl', '*.npy', '*.gz', '*.txt', '*.json',
                 '*.html', '*.css', '*.js', '*.prb', '*.ttf', '*.png'],

@@ -80,7 +80,7 @@ class PhyServer:
             signal.signal(signal.SIGTERM, self._handle_signal)
 
         import os
-        hostname = socket.gethostname()
+        hostname = socket.getfqdn()
         logger.info("PhyServer ready (pid %d, host %s)", os.getpid(), hostname)
         # Machine-parseable ready token (also emitted by __main__.py before
         # calling serve_forever, but repeated here for library use)

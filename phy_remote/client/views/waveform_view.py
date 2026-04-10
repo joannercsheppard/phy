@@ -174,15 +174,19 @@ class WaveformWidget(QWidget):
         _n_samples, n_channels = shapes.pop()
         n_channels = min(n_channels, self.max_channels)
 
-        self._rebuild_figure(fpl, n_channels)
+        try:
+            self._rebuild_figure(fpl, n_channels)
 
-        for clu_idx, (clu_id, waveforms) in enumerate(normalised.items()):
-            self._plot_waveforms(clu_idx, clu_id, waveforms, n_channels)
+            for clu_idx, (clu_id, waveforms) in enumerate(normalised.items()):
+                self._plot_waveforms(clu_idx, clu_id, waveforms, n_channels)
 
-        if self._fig is not None:
-            self._fig.canvas.set_logical_size(
-                self._fpl_widget.width(), self._fpl_widget.height()
-            )
+            if self._fig is not None:
+                self._fig.canvas.set_logical_size(
+                    self._fpl_widget.width(), self._fpl_widget.height()
+                )
+        except Exception as exc:
+            logger.exception("fastplotlib render failed")
+            self._show_placeholder(f"Render error: {exc}")
 
     def clear(self) -> None:
         """Remove all rendered content and show the placeholder."""

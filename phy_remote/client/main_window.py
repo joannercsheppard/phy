@@ -270,8 +270,10 @@ class _FetchWorker(QObject):
       2. Real spike waveforms on template channels — emitted via finished
          once extraction completes.
 
-    Creates its own PhyTransport inside run() so the ZMQ socket is owned
-    by the worker thread throughout its lifetime.
+    Takes the existing PhyTransport rather than creating a new one — the
+    ZMQ REQ socket is used from the worker thread, which is safe because
+    the main thread only touches it for label_cluster() (user-triggered,
+    never concurrent with a fetch).
     """
     template_ready = pyqtSignal(dict)   # {cluster_id: ndarray (n_samples, n_channels)}
     finished       = pyqtSignal(dict)   # {cluster_id: ndarray (n_spikes, n_samples, n_channels)}
@@ -279,38 +281,25 @@ class _FetchWorker(QObject):
 
     def __init__(
         self,
-        host: str,
-        port: int,
+        transport: PhyTransport,
         cluster_ids: list[int],
         n_spikes: int,
         skip_templates: bool = False,
     ):
         super().__init__()
-        self._host = host
-        self._port = port
+        self.transport = transport
         self.cluster_ids = cluster_ids
         self.n_spikes = n_spikes
         self.skip_templates = skip_templates
 
     @pyqtSlot()
     def run(self):
-        try:
-            transport = PhyTransport(host=self._host, port=self._port)
-        except Exception as exc:
-            self.error.emit(f"Transport connect failed: {exc}")
-            return
-        try:
-            self._fetch(transport)
-        finally:
-            transport.close()
-
-    def _fetch(self, transport: PhyTransport) -> None:
         if not self.skip_templates:
             # Stage 1: templates (fast — pre-computed, served from RAM)
             templates = {}
             for cid in self.cluster_ids:
                 try:
-                    _, tmpl = transport.get_templates(cid)
+                    _, tmpl = self.transport.get_templates(cid)
                     templates[cid] = tmpl
                 except Exception as exc:
                     self.error.emit(f"Template fetch failed for cluster {cid}: {exc}")
@@ -321,7 +310,7 @@ class _FetchWorker(QObject):
         waveforms = {}
         for cid in self.cluster_ids:
             try:
-                _, w = transport.get_waveforms(cid, self.n_spikes)
+                _, w = self.transport.get_waveforms(cid, self.n_spikes)
                 waveforms[cid] = w
             except Exception as exc:
                 self.error.emit(f"Waveform fetch failed for cluster {cid}: {exc}")
@@ -546,7 +535,7 @@ class MainWindow(QMainWindow):
 
     def _start_fetch(self, cluster_ids: list[int], skip_templates: bool) -> None:
         worker = _FetchWorker(
-            self.transport.host, self.transport.port,
+            self.transport,
             cluster_ids, self.n_spikes,
             skip_templates=skip_templates,
         )
@@ -587,6 +576,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_templates_ready(self, templates: dict) -> None:
+        logger.info("Templates ready for clusters %s", list(templates.keys()))
         for cid, tmpl in templates.items():
             self._template_cache.put(cid, tmpl)
         # Only update the view if this result is still relevant
@@ -595,9 +585,14 @@ class MainWindow(QMainWindow):
                 f"Cluster(s) {self._fmt_ids(list(templates.keys()))}  — loading waveforms…"
             )
             self._waveform_view.set_waveforms(templates)
+        else:
+            logger.info(
+                "Templates discarded (selection changed to %s)", self._current_cluster_ids
+            )
 
     @pyqtSlot(dict)
     def _on_waveforms_ready(self, waveforms: dict) -> None:
+        logger.info("Waveforms ready for clusters %s", list(waveforms.keys()))
         for cid, w in waveforms.items():
             self._waveform_cache.put(cid, w)
         # Only update the view if this result is still relevant
@@ -605,6 +600,10 @@ class MainWindow(QMainWindow):
             self._set_status(f"Cluster(s) {self._fmt_ids(list(waveforms.keys()))}")
             self._waveform_view.set_waveforms(waveforms)
             self._start_prefetch(self._current_cluster_ids)
+        else:
+            logger.info(
+                "Waveforms discarded (selection changed to %s)", self._current_cluster_ids
+            )
 
     @pyqtSlot(str)
     def _on_fetch_error(self, msg: str) -> None:

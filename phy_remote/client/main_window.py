@@ -19,18 +19,22 @@ Keyboard shortcuts (when cluster table has focus or anywhere):
   m  →  label selected clusters "mua"
   n  →  label selected clusters "noise"
   u  →  label selected clusters "unsorted"
+  j  →  move selection down one cluster
+  k  →  move selection up one cluster
 """
 
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Sequence
 
 import numpy as np
 
 from PyQt6.QtCore import (
     Qt, QThread, QObject, QSortFilterProxyModel,
-    QAbstractTableModel, QModelIndex, pyqtSignal, pyqtSlot,
+    QAbstractTableModel, QModelIndex, QItemSelectionModel,
+    pyqtSignal, pyqtSlot,
 )
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QFont
 from PyQt6.QtWidgets import (
@@ -192,6 +196,35 @@ class _ClusterTableDock(QDockWidget):
         rows = {idx.row() for idx in self._view.selectionModel().selectedRows()}
         return [self._model.cluster_id_at_row(r) for r in sorted(rows)]
 
+    def adjacent_cluster_ids(self, cluster_ids: list[int], n: int = 3) -> list[int]:
+        """Return up to n cluster ids before and n after the current selection."""
+        rows = sorted({idx.row() for idx in self._view.selectionModel().selectedRows()})
+        if not rows:
+            return []
+        total = self._model.rowCount()
+        result = []
+        for delta in range(1, n + 1):
+            if rows[0] - delta >= 0:
+                result.append(self._model.cluster_id_at_row(rows[0] - delta))
+            if rows[-1] + delta < total:
+                result.append(self._model.cluster_id_at_row(rows[-1] + delta))
+        return result
+
+    def move_selection(self, delta: int) -> None:
+        """Move selection by delta rows (negative = up, positive = down)."""
+        current = self._view.selectionModel().currentIndex()
+        if not current.isValid():
+            new_row = 0 if delta > 0 else self._model.rowCount() - 1
+        else:
+            new_row = max(0, min(self._model.rowCount() - 1, current.row() + delta))
+        new_index = self._model.index(new_row, 0)
+        self._view.selectionModel().setCurrentIndex(
+            new_index,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect |
+            QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self._view.scrollTo(new_index)
+
     def _on_selection_changed(self, *_) -> None:
         ids = self.selected_cluster_ids()
         if ids:
@@ -199,7 +232,34 @@ class _ClusterTableDock(QDockWidget):
 
 
 # ---------------------------------------------------------------------------
-# Async fetch worker
+# LRU cache
+# ---------------------------------------------------------------------------
+
+class _LRUCache:
+    """Simple LRU cache keyed by cluster id."""
+
+    def __init__(self, maxsize: int = 20):
+        self._data: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, key):
+        if key not in self._data:
+            return None
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key, value) -> None:
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+    def __contains__(self, key) -> bool:
+        return key in self._data
+
+
+# ---------------------------------------------------------------------------
+# Async fetch workers
 # ---------------------------------------------------------------------------
 
 class _FetchWorker(QObject):
@@ -209,40 +269,106 @@ class _FetchWorker(QObject):
          can show something immediately.
       2. Real spike waveforms on template channels — emitted via finished
          once extraction completes.
+
+    Creates its own PhyTransport inside run() so the ZMQ socket is owned
+    by the worker thread throughout its lifetime.
     """
     template_ready = pyqtSignal(dict)   # {cluster_id: ndarray (n_samples, n_channels)}
     finished       = pyqtSignal(dict)   # {cluster_id: ndarray (n_spikes, n_samples, n_channels)}
     error          = pyqtSignal(str)
 
-    def __init__(self, transport, cluster_ids, n_spikes):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        cluster_ids: list[int],
+        n_spikes: int,
+        skip_templates: bool = False,
+    ):
         super().__init__()
-        self.transport = transport
+        self._host = host
+        self._port = port
         self.cluster_ids = cluster_ids
         self.n_spikes = n_spikes
+        self.skip_templates = skip_templates
 
     @pyqtSlot()
     def run(self):
-        # Stage 1: templates (fast)
-        templates = {}
-        for cid in self.cluster_ids:
-            try:
-                _, tmpl = self.transport.get_templates(cid)
-                templates[cid] = tmpl
-            except Exception as exc:
-                self.error.emit(f"Template fetch failed for cluster {cid}: {exc}")
-                return
-        self.template_ready.emit(templates)
+        try:
+            transport = PhyTransport(host=self._host, port=self._port)
+        except Exception as exc:
+            self.error.emit(f"Transport connect failed: {exc}")
+            return
+        try:
+            self._fetch(transport)
+        finally:
+            transport.close()
 
-        # Stage 2: real waveforms on template channels (slower)
+    def _fetch(self, transport: PhyTransport) -> None:
+        if not self.skip_templates:
+            # Stage 1: templates (fast — pre-computed, served from RAM)
+            templates = {}
+            for cid in self.cluster_ids:
+                try:
+                    _, tmpl = transport.get_templates(cid)
+                    templates[cid] = tmpl
+                except Exception as exc:
+                    self.error.emit(f"Template fetch failed for cluster {cid}: {exc}")
+                    return
+            self.template_ready.emit(templates)
+
+        # Stage 2: real waveforms restricted to template channels (slower)
         waveforms = {}
         for cid in self.cluster_ids:
             try:
-                _, w = self.transport.get_waveforms(cid, self.n_spikes)
+                _, w = transport.get_waveforms(cid, self.n_spikes)
                 waveforms[cid] = w
             except Exception as exc:
                 self.error.emit(f"Waveform fetch failed for cluster {cid}: {exc}")
                 return
         self.finished.emit(waveforms)
+
+
+class _PrefetchWorker(QObject):
+    """
+    Background worker that silently pre-warms the template cache for
+    clusters adjacent to the current selection.  Creates its own
+    transport so it never shares a ZMQ socket with _FetchWorker.
+    """
+    template_ready = pyqtSignal(int, object)   # (cluster_id, ndarray)
+    finished       = pyqtSignal()
+
+    def __init__(self, host: str, port: int, cluster_ids: list[int]):
+        super().__init__()
+        self._host = host
+        self._port = port
+        self.cluster_ids = list(cluster_ids)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            transport = PhyTransport(host=self._host, port=self._port)
+        except Exception as exc:
+            logger.debug("Prefetch transport failed: %s", exc)
+            self.finished.emit()
+            return
+        try:
+            for cid in self.cluster_ids:
+                if self._cancelled:
+                    break
+                try:
+                    _, tmpl = transport.get_templates(cid)
+                    if not self._cancelled:
+                        self.template_ready.emit(cid, tmpl)
+                except Exception as exc:
+                    logger.debug("Prefetch skipped cluster %d: %s", cid, exc)
+        finally:
+            transport.close()
+            self.finished.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +388,14 @@ class MainWindow(QMainWindow):
         self.transport = transport
         self.n_spikes = n_spikes
         self._fetch_thread: QThread | None = None
+        self._prefetch_thread: QThread | None = None
+        self._prefetch_worker: _PrefetchWorker | None = None
+
+        # Caches: templates are cheap (fast to fetch, ~KB each),
+        # waveforms are expensive (slow to fetch, ~MB each).
+        self._template_cache = _LRUCache(maxsize=30)
+        self._waveform_cache = _LRUCache(maxsize=10)
+        self._current_cluster_ids: list[int] = []
 
         self.setWindowTitle("phy-remote")
         self.resize(1400, 900)
@@ -286,11 +420,15 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self._cluster_dock.toggleViewAction())
 
-        # Keyboard shortcuts for labelling
+        # Keyboard shortcuts — labelling
         self._add_label_shortcut("g", "good")
         self._add_label_shortcut("m", "mua")
         self._add_label_shortcut("n", "noise")
         self._add_label_shortcut("u", "unsorted")
+
+        # Keyboard shortcuts — navigation (j = down, k = up, vim-style)
+        self._add_nav_shortcut("j", +1)
+        self._add_nav_shortcut("k", -1)
 
         # Load cluster table
         self._load_cluster_info()
@@ -322,6 +460,21 @@ class MainWindow(QMainWindow):
         sc = QShortcut(QKeySequence(key), self)
         sc.activated.connect(lambda lbl=label: self._apply_label(lbl))
 
+    def _add_nav_shortcut(self, key: str, delta: int) -> None:
+        sc = QShortcut(QKeySequence(key), self)
+        sc.activated.connect(lambda d=delta: self._navigate_cluster(d))
+
+    def _navigate_cluster(self, delta: int) -> None:
+        """Move the cluster table selection by delta rows."""
+        self._cluster_dock.move_selection(delta)
+
+    @staticmethod
+    def _fmt_ids(ids: list[int]) -> str:
+        s = ", ".join(str(c) for c in ids[:4])
+        if len(ids) > 4:
+            s += f" (+{len(ids) - 4})"
+        return s
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -340,24 +493,68 @@ class MainWindow(QMainWindow):
             self._set_status(f"Error: {exc}")
 
     # ------------------------------------------------------------------
-    # Cluster selection → async waveform fetch
+    # Cluster selection → async waveform fetch with cache + prefetch
     # ------------------------------------------------------------------
 
     def _on_clusters_selected(self, cluster_ids: list[int]) -> None:
+        self._current_cluster_ids = cluster_ids
+
+        # Cancel any in-flight prefetch
+        if self._prefetch_worker is not None:
+            self._prefetch_worker.cancel()
+        if self._prefetch_thread and self._prefetch_thread.isRunning():
+            self._prefetch_thread.quit()
+            self._prefetch_thread.wait(100)
+
+        # Cancel in-flight main fetch
         if self._fetch_thread and self._fetch_thread.isRunning():
             self._fetch_thread.quit()
             self._fetch_thread.wait(300)
 
-        clu_str = ", ".join(str(c) for c in cluster_ids[:4])
-        if len(cluster_ids) > 4:
-            clu_str += f" (+{len(cluster_ids) - 4})"
-        self._set_status(f"Fetching waveforms: {clu_str}…")
+        # --- Check template cache ---
+        cached_templates = {
+            cid: self._template_cache.get(cid)
+            for cid in cluster_ids
+            if cid in self._template_cache
+        }
 
-        worker = _FetchWorker(self.transport, cluster_ids, self.n_spikes)
+        if len(cached_templates) == len(cluster_ids):
+            # All templates in cache → show immediately
+            self._waveform_view.set_waveforms(cached_templates)
+
+            # Check if real waveforms are also cached
+            cached_waveforms = {
+                cid: self._waveform_cache.get(cid)
+                for cid in cluster_ids
+                if cid in self._waveform_cache
+            }
+            if len(cached_waveforms) == len(cluster_ids):
+                self._set_status(f"Cluster(s) {self._fmt_ids(cluster_ids)}  (cached)")
+                self._start_prefetch(cluster_ids)
+                return
+
+            # Show templates now; fetch only real waveforms in background
+            self._set_status(
+                f"Cluster(s) {self._fmt_ids(cluster_ids)}  — loading waveforms…"
+            )
+            self._start_fetch(cluster_ids, skip_templates=True)
+            return
+
+        # Not cached → full two-stage fetch
+        self._set_status(f"Fetching: {self._fmt_ids(cluster_ids)}…")
+        self._start_fetch(cluster_ids, skip_templates=False)
+
+    def _start_fetch(self, cluster_ids: list[int], skip_templates: bool) -> None:
+        worker = _FetchWorker(
+            self.transport.host, self.transport.port,
+            cluster_ids, self.n_spikes,
+            skip_templates=skip_templates,
+        )
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.template_ready.connect(self._on_templates_ready)
+        if not skip_templates:
+            worker.template_ready.connect(self._on_templates_ready)
         worker.finished.connect(self._on_waveforms_ready)
         worker.finished.connect(thread.quit)
         worker.error.connect(self._on_fetch_error)
@@ -366,16 +563,58 @@ class MainWindow(QMainWindow):
         self._fetch_thread = thread
         thread.start()
 
+    def _start_prefetch(self, current_ids: list[int]) -> None:
+        """Silently warm the template cache for adjacent clusters."""
+        adjacent = self._cluster_dock.adjacent_cluster_ids(current_ids, n=3)
+        to_fetch = [cid for cid in adjacent if cid not in self._template_cache]
+        if not to_fetch:
+            return
+
+        worker = _PrefetchWorker(self.transport.host, self.transport.port, to_fetch)
+        self._prefetch_worker = worker
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.template_ready.connect(self._on_prefetch_template)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        self._prefetch_thread = thread
+        thread.start()
+
+    # ------------------------------------------------------------------
+    # Signal handlers
+    # ------------------------------------------------------------------
+
     @pyqtSlot(dict)
-    def _on_waveforms_ready(self, templates_per_cluster: dict) -> None:
-        ids = ", ".join(str(k) for k in templates_per_cluster)
-        self._set_status(f"Templates: {ids}")
-        self._waveform_view.set_waveforms(templates_per_cluster)
+    def _on_templates_ready(self, templates: dict) -> None:
+        for cid, tmpl in templates.items():
+            self._template_cache.put(cid, tmpl)
+        # Only update the view if this result is still relevant
+        if set(templates.keys()) == set(self._current_cluster_ids):
+            self._set_status(
+                f"Cluster(s) {self._fmt_ids(list(templates.keys()))}  — loading waveforms…"
+            )
+            self._waveform_view.set_waveforms(templates)
+
+    @pyqtSlot(dict)
+    def _on_waveforms_ready(self, waveforms: dict) -> None:
+        for cid, w in waveforms.items():
+            self._waveform_cache.put(cid, w)
+        # Only update the view if this result is still relevant
+        if set(waveforms.keys()) == set(self._current_cluster_ids):
+            self._set_status(f"Cluster(s) {self._fmt_ids(list(waveforms.keys()))}")
+            self._waveform_view.set_waveforms(waveforms)
+            self._start_prefetch(self._current_cluster_ids)
 
     @pyqtSlot(str)
     def _on_fetch_error(self, msg: str) -> None:
         logger.error("Fetch error: %s", msg)
         self._set_status(f"Error: {msg}")
+
+    @pyqtSlot(int, object)
+    def _on_prefetch_template(self, cluster_id: int, template) -> None:
+        self._template_cache.put(cluster_id, template)
+        logger.debug("Prefetched template for cluster %d", cluster_id)
 
     # ------------------------------------------------------------------
     # Labelling
@@ -405,7 +644,12 @@ class MainWindow(QMainWindow):
         self._status_label.setText(text)
 
     def closeEvent(self, event) -> None:
+        if self._prefetch_worker is not None:
+            self._prefetch_worker.cancel()
         if self._fetch_thread and self._fetch_thread.isRunning():
             self._fetch_thread.quit()
             self._fetch_thread.wait(1000)
+        if self._prefetch_thread and self._prefetch_thread.isRunning():
+            self._prefetch_thread.quit()
+            self._prefetch_thread.wait(500)
         super().closeEvent(event)

@@ -5,8 +5,14 @@ Layout
 ------
 One subplot per channel, arranged in a single column mirroring probe depth
 (top = highest channel index, bottom = lowest, matching phy's probe view).
-Each subplot shows up to `max_spikes` individual waveforms as semi-transparent
-lines, plus the per-cluster mean in a solid contrasting colour.
+
+Each subplot shows:
+  - Individual spike traces (semi-transparent, up to max_spikes per cluster)
+  - Per-cluster mean in a solid contrasting colour
+
+When templates only are available (before real waveforms arrive) the mean is
+drawn as a single solid line — the individual spikes appear once the real
+waveform fetch completes.
 
 Cluster colours follow the same 10-colour cycle used throughout phy-remote
 (see CLUSTER_COLORS below).
@@ -115,19 +121,23 @@ class WaveformWidget(QWidget):
 
     def set_waveforms(
         self,
-        templates_per_cluster: dict[int, np.ndarray],
+        data_per_cluster: dict[int, np.ndarray],
     ) -> None:
         """
-        Render template waveforms for one or more clusters.
+        Render waveforms for one or more clusters.
 
         Parameters
         ----------
-        templates_per_cluster : dict[cluster_id -> ndarray]
-            Each array has shape ``(n_samples, n_channels)``, dtype float32.
-            This is the pre-computed template (mean waveform), which loads
-            instantly regardless of recording length.
+        data_per_cluster : dict[cluster_id -> ndarray]
+            Each array has shape either:
+            - ``(n_samples, n_channels)``             — template / mean only
+            - ``(n_spikes, n_samples, n_channels)``   — individual spikes + mean
+
+        Calling this method a second time for the same channel layout (e.g.
+        upgrading from template to real waveforms) clears and redraws in place
+        without rebuilding the figure, so the transition is smooth.
         """
-        if not templates_per_cluster:
+        if not data_per_cluster:
             self._show_placeholder("No waveforms to display")
             return
 
@@ -140,18 +150,34 @@ class WaveformWidget(QWidget):
             )
             return
 
-        # All templates must have the same shape
-        shapes = {arr.shape for arr in templates_per_cluster.values()}
-        if len(shapes) > 1:
-            logger.error("Mismatched template shapes: %s", shapes)
+        # Normalise everything to (n_spikes, n_samples, n_channels)
+        # A template (n_samples, n_channels) becomes a 1-spike array.
+        normalised: dict[int, np.ndarray] = {}
+        for cid, arr in data_per_cluster.items():
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.ndim == 2:
+                normalised[cid] = arr[np.newaxis]    # (1, n_samples, n_channels)
+            elif arr.ndim == 3:
+                normalised[cid] = arr
+            else:
+                logger.error(
+                    "Cluster %d: unexpected waveform shape %s — skipping", cid, arr.shape
+                )
+
+        if not normalised:
             return
-        n_samples, n_channels = shapes.pop()
+
+        shapes = {a.shape[1:] for a in normalised.values()}
+        if len(shapes) > 1:
+            logger.error("Mismatched waveform shapes across clusters: %s", shapes)
+            return
+        _n_samples, n_channels = shapes.pop()
         n_channels = min(n_channels, self.max_channels)
 
         self._rebuild_figure(fpl, n_channels)
 
-        for clu_idx, (clu_id, template) in enumerate(templates_per_cluster.items()):
-            self._plot_template(clu_idx, clu_id, template, n_channels)
+        for clu_idx, (clu_id, waveforms) in enumerate(normalised.items()):
+            self._plot_waveforms(clu_idx, clu_id, waveforms, n_channels)
 
         if self._fig is not None:
             self._fig.canvas.set_logical_size(
@@ -173,12 +199,11 @@ class WaveformWidget(QWidget):
         self._placeholder.show()
 
     def _rebuild_figure(self, fpl, n_channels: int) -> None:
-        """Create (or re-create) the fastplotlib Figure with n_channels subplots."""
+        """Create (or re-use) the fastplotlib Figure with n_channels subplots."""
         if self._fig is not None and self._n_channels == n_channels:
             # Re-use existing figure: just clear each subplot
             for row in range(n_channels):
-                subplot = self._fig[row, 0]
-                subplot.clear()
+                self._fig[row, 0].clear()
             return
 
         # Tear down old figure/widget
@@ -190,42 +215,71 @@ class WaveformWidget(QWidget):
 
         self._placeholder.hide()
 
-        # Build new figure: n_channels rows × 1 column, all y-axes shared
+        # Build new figure: n_channels rows × 1 column
         self._fig = fpl.Figure(
             shape=(n_channels, 1),
             canvas="qt",
         )
         self._n_channels = n_channels
 
-        # The Figure canvas is a wgpu QWidget
         self._fpl_widget = self._fig.canvas
         self._layout.addWidget(self._fpl_widget)
         self._fpl_widget.show()
 
         # Connect click events
         for row in range(n_channels):
-            channel_idx = row  # captured by lambda
             self._fig[row, 0].canvas.add_event_handler(
-                lambda event, ch=channel_idx: self._on_channel_click(event, ch),
+                lambda event, ch=row: self._on_channel_click(event, ch),
                 "click",
             )
 
-    def _plot_template(
+    def _plot_waveforms(
         self,
         clu_idx: int,
         clu_id: int,
-        template: np.ndarray,
+        waveforms: np.ndarray,   # (n_spikes, n_samples, n_channels)
         n_channels: int,
     ) -> None:
-        """Plot a single template (n_samples, n_channels) across channel subplots."""
-        color = _cluster_mean_color(clu_idx)
+        """
+        Draw individual spike traces (semi-transparent) + mean (solid).
+
+        When n_spikes == 1 (template) only the mean line is drawn.
+        """
+        n_spikes = waveforms.shape[0]
+        spike_color = _cluster_color(clu_idx, alpha=0.20)
+        mean_color  = _cluster_mean_color(clu_idx)
+
+        # Subsample if too many spikes
+        indices = np.arange(n_spikes)
+        if n_spikes > self.max_spikes:
+            rng = np.random.default_rng(seed=clu_id)
+            indices = rng.choice(indices, size=self.max_spikes, replace=False)
+            indices.sort()
+
         for ch in range(n_channels):
-            self._fig[ch, 0].add_line(
-                template[:, ch],
-                colors=color,
-                thickness=2.0,
+            subplot = self._fig[ch, 0]
+
+            # Individual traces (skip for templates, i.e. n_spikes == 1)
+            if n_spikes > 1:
+                for i in indices:
+                    subplot.add_line(
+                        waveforms[i, :, ch],
+                        colors=spike_color,
+                        thickness=1.0,
+                    )
+
+            # Mean / template line
+            mean_wf = waveforms[:, :, ch].mean(axis=0)
+            subplot.add_line(
+                mean_wf,
+                colors=mean_color,
+                thickness=2.5,
             )
-        logger.debug("Plotted template for cluster %d (%d channels)", clu_id, n_channels)
+
+        logger.debug(
+            "Plotted %d waveform(s) for cluster %d (%d channels)",
+            n_spikes, clu_id, n_channels,
+        )
 
     def _on_channel_click(self, event, channel_idx: int) -> None:
         self.channel_clicked.emit(channel_idx)

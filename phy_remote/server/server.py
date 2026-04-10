@@ -55,15 +55,24 @@ class PhyServer:
 
     def __init__(self, model=None, port: int = 5555, host: str = "127.0.0.1"):
         self.model = model
-        self.port = port
         self.host = host
         self._running = False
 
         self._ctx = zmq.Context()
         self._sock = self._ctx.socket(zmq.REP)
-        addr = f"tcp://{host}:{port}"
-        self._sock.bind(addr)
-        logger.info("PhyServer bound to %s", addr)
+
+        # Try the requested port; if it's taken walk up until one is free.
+        for candidate in range(port, port + 20):
+            try:
+                self._sock.bind(f"tcp://{host}:{candidate}")
+                self.port = candidate
+                break
+            except zmq.ZMQError:
+                continue
+        else:
+            raise OSError(f"No free port found in range {port}–{port + 19}")
+
+        logger.info("PhyServer bound to tcp://%s:%d", host, self.port)
 
     # ------------------------------------------------------------------
     # Public API
@@ -157,16 +166,24 @@ class PhyServer:
 
     def _handle_get_waveforms(self, req: dict) -> list[bytes]:
         """
-        Return waveforms for a cluster.
+        Return waveforms for a cluster, restricted to template channels.
+
+        Reads only the ~10-20 channels near the probe site rather than all
+        channels — same as phy does locally, and essential for long recordings
+        where seeking across all channels is prohibitively slow.
 
         Request fields
         --------------
         cluster_id : int
-        n_spikes   : int, optional  max spikes to return (default 100)
+        n_spikes   : int, optional  (default 50)
         """
         self._require_model()
         cluster_id = int(req["cluster_id"])
-        n_spikes = int(req.get("n_spikes", 100))
+        n_spikes = int(req.get("n_spikes", 50))
+
+        # Get the template's local channel_ids — typically 10-20 channels
+        template = self.model.get_template(cluster_id)
+        channel_ids = template.channel_ids if template is not None else None
 
         spike_ids = self.model.get_cluster_spikes(cluster_id)
         if len(spike_ids) > n_spikes:
@@ -174,13 +191,19 @@ class PhyServer:
             spike_ids = rng.choice(spike_ids, size=n_spikes, replace=False)
             spike_ids.sort()
 
-        # shape: (n_spikes, n_samples, n_channels)
-        waveforms = self.model.get_waveforms(spike_ids)
+        # shape: (n_spikes, n_samples, n_template_channels)
+        waveforms = self.model.get_waveforms(spike_ids, channel_ids)
         if waveforms is None:
             return encode_response(status="error", error="no waveforms available")
 
         arr = np.asarray(waveforms, dtype=np.float32)
-        return encode_response(array=arr, cluster_id=cluster_id, n_spikes=len(spike_ids))
+        ch_list = channel_ids.tolist() if channel_ids is not None else []
+        return encode_response(
+            array=arr,
+            cluster_id=cluster_id,
+            n_spikes=len(spike_ids),
+            channel_ids=ch_list,
+        )
 
     def _handle_get_spike_times(self, req: dict) -> list[bytes]:
         """Return spike times (seconds) for a cluster."""

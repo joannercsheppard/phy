@@ -203,8 +203,16 @@ class _ClusterTableDock(QDockWidget):
 # ---------------------------------------------------------------------------
 
 class _FetchWorker(QObject):
-    finished = pyqtSignal(dict)   # {cluster_id: waveform_array}
-    error    = pyqtSignal(str)
+    """
+    Fetches waveforms for selected clusters in two stages:
+      1. Templates (instant) — emitted via template_ready so the view
+         can show something immediately.
+      2. Real spike waveforms on template channels — emitted via finished
+         once extraction completes.
+    """
+    template_ready = pyqtSignal(dict)   # {cluster_id: ndarray (n_samples, n_channels)}
+    finished       = pyqtSignal(dict)   # {cluster_id: ndarray (n_spikes, n_samples, n_channels)}
+    error          = pyqtSignal(str)
 
     def __init__(self, transport, cluster_ids, n_spikes):
         super().__init__()
@@ -214,18 +222,27 @@ class _FetchWorker(QObject):
 
     @pyqtSlot()
     def run(self):
-        result = {}
+        # Stage 1: templates (fast)
+        templates = {}
         for cid in self.cluster_ids:
             try:
-                _, waveforms = self.transport.get_waveforms(cid, self.n_spikes)
-                result[cid] = waveforms
-            except TransportError as exc:
-                self.error.emit(f"Cluster {cid}: {exc}")
-                return
+                _, tmpl = self.transport.get_templates(cid)
+                templates[cid] = tmpl
             except Exception as exc:
-                self.error.emit(str(exc))
+                self.error.emit(f"Template fetch failed for cluster {cid}: {exc}")
                 return
-        self.finished.emit(result)
+        self.template_ready.emit(templates)
+
+        # Stage 2: real waveforms on template channels (slower)
+        waveforms = {}
+        for cid in self.cluster_ids:
+            try:
+                _, w = self.transport.get_waveforms(cid, self.n_spikes)
+                waveforms[cid] = w
+            except Exception as exc:
+                self.error.emit(f"Waveform fetch failed for cluster {cid}: {exc}")
+                return
+        self.finished.emit(waveforms)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +357,7 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.template_ready.connect(self._on_templates_ready)
         worker.finished.connect(self._on_waveforms_ready)
         worker.finished.connect(thread.quit)
         worker.error.connect(self._on_fetch_error)
@@ -349,10 +367,10 @@ class MainWindow(QMainWindow):
         thread.start()
 
     @pyqtSlot(dict)
-    def _on_waveforms_ready(self, waveforms_per_cluster: dict) -> None:
-        n = sum(v.shape[0] for v in waveforms_per_cluster.values())
-        self._set_status(f"Showing {n} spikes across {len(waveforms_per_cluster)} cluster(s)")
-        self._waveform_view.set_waveforms(waveforms_per_cluster)
+    def _on_waveforms_ready(self, templates_per_cluster: dict) -> None:
+        ids = ", ".join(str(k) for k in templates_per_cluster)
+        self._set_status(f"Templates: {ids}")
+        self._waveform_view.set_waveforms(templates_per_cluster)
 
     @pyqtSlot(str)
     def _on_fetch_error(self, msg: str) -> None:

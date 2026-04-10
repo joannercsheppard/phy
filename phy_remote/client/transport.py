@@ -36,7 +36,7 @@ from phy_remote.shared.protocol import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT_MS = 10_000  # 10 s
+_DEFAULT_TIMEOUT_MS = 60_000  # 60 s — on-the-fly waveform extraction can be slow
 
 
 class TransportError(RuntimeError):

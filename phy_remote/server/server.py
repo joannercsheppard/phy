@@ -28,6 +28,8 @@ from phy_remote.shared.protocol import (
     CMD_GET_FEATURES,
     CMD_GET_TEMPLATES,
     CMD_GET_CLUSTER_IDS,
+    CMD_GET_CLUSTER_INFO,
+    CMD_LABEL_CLUSTER,
     decode_request,
     encode_response,
 )
@@ -133,6 +135,8 @@ class PhyServer:
             CMD_GET_FEATURES: self._handle_get_features,
             CMD_GET_TEMPLATES: self._handle_get_templates,
             CMD_GET_CLUSTER_IDS: self._handle_get_cluster_ids,
+            CMD_GET_CLUSTER_INFO: self._handle_get_cluster_info,
+            CMD_LABEL_CLUSTER: self._handle_label_cluster,
         }.get(cmd)
 
         if handler is None:
@@ -225,6 +229,92 @@ class PhyServer:
         self._require_model()
         cluster_ids = np.asarray(self.model.cluster_ids, dtype=np.int32)
         return encode_response(array=cluster_ids)
+
+    def _handle_get_cluster_info(self, req: dict) -> list[bytes]:
+        """
+        Return a summary table for all clusters.
+
+        Response header contains a 'clusters' list, each entry:
+          { id, label, n_spikes, amplitude, fr }
+
+        No array frame — all data fits in the JSON header.
+        """
+        self._require_model()
+        m = self.model
+
+        # spike counts per cluster
+        spike_clusters = m.spike_clusters
+        cluster_ids = m.cluster_ids.tolist()
+        counts = {int(cid): int(np.sum(spike_clusters == cid)) for cid in cluster_ids}
+
+        # labels / groups (good / mua / noise / unsorted)
+        groups = {}
+        if hasattr(m, 'cluster_groups') and m.cluster_groups:
+            groups = {int(k): str(v) for k, v in m.cluster_groups.items()}
+
+        # mean amplitude per cluster (from spike amplitudes if available)
+        amplitudes = {}
+        if hasattr(m, 'amplitudes') and m.amplitudes is not None:
+            for cid in cluster_ids:
+                mask = spike_clusters == cid
+                if mask.any():
+                    amplitudes[int(cid)] = float(np.mean(m.amplitudes[mask]))
+
+        # firing rate: n_spikes / recording duration
+        duration = float(m.spike_times[-1]) if len(m.spike_times) else 1.0
+
+        clusters = []
+        for cid in cluster_ids:
+            cid = int(cid)
+            n = counts.get(cid, 0)
+            clusters.append({
+                "id": cid,
+                "label": groups.get(cid, "unsorted"),
+                "n_spikes": n,
+                "amplitude": round(amplitudes.get(cid, 0.0), 1),
+                "fr": round(n / duration, 2),
+            })
+
+        return encode_response(clusters=clusters)
+
+    def _handle_label_cluster(self, req: dict) -> list[bytes]:
+        """
+        Set the label for one or more clusters and save to disk.
+
+        Request fields
+        --------------
+        cluster_ids : list[int]  (or a single int as 'cluster_id')
+        label       : str  one of good / mua / noise / unsorted
+        """
+        self._require_model()
+        VALID = {"good", "mua", "noise", "unsorted"}
+        label = str(req.get("label", ""))
+        if label not in VALID:
+            return encode_response(
+                status="error",
+                error=f"invalid label {label!r}, must be one of {sorted(VALID)}",
+            )
+
+        # Accept either cluster_ids (list) or cluster_id (scalar)
+        if "cluster_ids" in req:
+            cluster_ids = [int(c) for c in req["cluster_ids"]]
+        else:
+            cluster_ids = [int(req["cluster_id"])]
+
+        m = self.model
+        if not hasattr(m, 'cluster_groups') or m.cluster_groups is None:
+            m.cluster_groups = {}
+        for cid in cluster_ids:
+            m.cluster_groups[cid] = label
+
+        # Persist: phy uses save_metadata to write cluster_group.tsv
+        if hasattr(m, 'save_metadata'):
+            m.save_metadata("group", m.cluster_groups)
+        elif hasattr(m, 'save'):
+            m.save()
+
+        logger.info("Labelled cluster(s) %s as %r", cluster_ids, label)
+        return encode_response(cluster_ids=cluster_ids, label=label)
 
     # ------------------------------------------------------------------
     # Helpers

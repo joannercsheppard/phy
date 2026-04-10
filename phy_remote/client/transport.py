@@ -28,6 +28,8 @@ from phy_remote.shared.protocol import (
     CMD_GET_FEATURES,
     CMD_GET_TEMPLATES,
     CMD_GET_CLUSTER_IDS,
+    CMD_GET_CLUSTER_INFO,
+    CMD_LABEL_CLUSTER,
     encode_request,
     decode_response,
 )
@@ -164,6 +166,33 @@ class PhyTransport:
         if array is None:
             raise TransportError("server sent no array for get_cluster_ids")
         return array
+
+    def get_cluster_info(self) -> list[dict]:
+        """
+        Return summary info for all clusters.
+
+        Returns
+        -------
+        list of dicts, each with keys:
+            id, label, n_spikes, amplitude, fr
+        """
+        header, _ = self._call(CMD_GET_CLUSTER_INFO)
+        return header["clusters"]
+
+    def label_cluster(
+        self, cluster_ids: "int | list[int]", label: str
+    ) -> None:
+        """
+        Set the label for one or more clusters and save to disk on the server.
+
+        Parameters
+        ----------
+        cluster_ids : int or list[int]
+        label : "good" | "mua" | "noise" | "unsorted"
+        """
+        if isinstance(cluster_ids, int):
+            cluster_ids = [cluster_ids]
+        self._call(CMD_LABEL_CLUSTER, cluster_ids=cluster_ids, label=label)
 
     # ------------------------------------------------------------------
     # Low-level send/recv

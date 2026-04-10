@@ -30,6 +30,8 @@ CMD_GET_SPIKE_TIMES = "get_spike_times"
 CMD_GET_FEATURES = "get_features"
 CMD_GET_TEMPLATES = "get_templates"
 CMD_GET_CLUSTER_IDS = "get_cluster_ids"
+CMD_GET_CLUSTER_INFO = "get_cluster_info"   # all clusters: id, label, n_spikes, amplitude
+CMD_LABEL_CLUSTER = "label_cluster"          # set good/mua/noise/unsorted, save to disk
 
 # ---------------------------------------------------------------------------
 # Encoding helpers

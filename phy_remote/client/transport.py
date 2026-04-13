@@ -34,6 +34,7 @@ from phy_remote.shared.protocol import (
     CMD_GET_CHANNEL_POSITIONS,
     CMD_GET_TRACES,
     CMD_GET_SPIKES_IN_WINDOW,
+    CMD_GET_SIMILAR_CLUSTERS,
     encode_request,
     decode_response,
 )
@@ -227,6 +228,21 @@ class PhyTransport:
             kwargs["cluster_ids"] = cluster_ids
         _, array = self._call(CMD_GET_SPIKES_IN_WINDOW, **kwargs)
         return array if array is not None else np.empty((0, 2), dtype=np.float64)
+
+    def get_similar_clusters(self, cluster_id: int, limit: int = 100) -> list[dict]:
+        """
+        Return ranked similar clusters for a primary cluster.
+
+        Returns
+        -------
+        list[dict]
+            Each row contains at least:
+            id, similarity, n_spikes, label, amplitude, fr
+        """
+        header, _ = self._call(
+            CMD_GET_SIMILAR_CLUSTERS, cluster_id=int(cluster_id), limit=int(limit)
+        )
+        return header.get("similar_clusters", [])
 
     def get_channel_positions(self) -> np.ndarray:
         """Return probe channel positions as (n_channels, 2) float32 array [x, y] µm."""

@@ -34,6 +34,7 @@ from phy_remote.shared.protocol import (
     CMD_GET_CHANNEL_POSITIONS,
     CMD_GET_TRACES,
     CMD_GET_SPIKES_IN_WINDOW,
+    CMD_GET_SIMILAR_CLUSTERS,
     decode_request,
     encode_response,
 )
@@ -154,6 +155,7 @@ class PhyServer:
             CMD_GET_CHANNEL_POSITIONS: self._handle_get_channel_positions,
             CMD_GET_TRACES: self._handle_get_traces,
             CMD_GET_SPIKES_IN_WINDOW: self._handle_get_spikes_in_window,
+            CMD_GET_SIMILAR_CLUSTERS: self._handle_get_similar_clusters,
         }.get(cmd)
 
         if handler is None:
@@ -438,6 +440,86 @@ class PhyServer:
         self._require_model()
         positions = np.asarray(self.model.channel_positions, dtype=np.float32)
         return encode_response(array=positions)
+
+    def _handle_get_similar_clusters(self, req: dict) -> list[bytes]:
+        """
+        Return a ranked similarity list for one selected cluster (Phy-style).
+
+        Request fields
+        --------------
+        cluster_id : int
+        limit      : int, optional (default 100)
+        """
+        self._require_model()
+        m = self.model
+        cluster_id = int(req["cluster_id"])
+        limit = int(req.get("limit", 100))
+
+        if not hasattr(m, "similar_templates") or m.similar_templates is None:
+            return encode_response(similar_clusters=[])
+        if not hasattr(m, "spike_templates") or m.spike_templates is None:
+            return encode_response(similar_clusters=[])
+
+        cluster_ids = [int(c) for c in np.asarray(m.cluster_ids, dtype=np.int64)]
+        if cluster_id not in cluster_ids:
+            return encode_response(similar_clusters=[])
+
+        # Build cluster -> template-counts mapping, mirroring Phy's TemplateController logic.
+        spike_clusters = np.asarray(m.spike_clusters)
+        spike_templates = np.asarray(m.spike_templates)
+        n_templates = int(getattr(m, "n_templates", int(np.max(spike_templates)) + 1))
+
+        counts_by_cluster: dict[int, np.ndarray] = {}
+        for cid in cluster_ids:
+            spike_ids = np.nonzero(spike_clusters == cid)[0]
+            st = spike_templates[spike_ids]
+            counts_by_cluster[cid] = np.bincount(st, minlength=n_templates)
+
+        temp_i = np.nonzero(counts_by_cluster[cluster_id])[0]
+        if len(temp_i) == 0:
+            return encode_response(similar_clusters=[])
+
+        similar_templates = np.asarray(m.similar_templates)
+        sims = np.max(similar_templates[temp_i, :], axis=0)
+
+        def _sim_for_cluster(cj: int) -> float:
+            temp_j = np.nonzero(counts_by_cluster[cj])[0]
+            if len(temp_j) == 0:
+                return 0.0
+            return float(np.max(sims[temp_j]))
+
+        # Precompute info table fields.
+        counts = {int(cid): int(np.sum(spike_clusters == cid)) for cid in cluster_ids}
+        groups = {}
+        if hasattr(m, "cluster_groups") and m.cluster_groups:
+            groups = {int(k): str(v) for k, v in m.cluster_groups.items()}
+        amplitudes = {}
+        if hasattr(m, "amplitudes") and m.amplitudes is not None:
+            for cid in cluster_ids:
+                mask = spike_clusters == cid
+                if mask.any():
+                    amplitudes[cid] = float(np.mean(m.amplitudes[mask]))
+        duration = float(m.spike_times[-1]) if len(m.spike_times) else 1.0
+
+        rows = []
+        for cid in cluster_ids:
+            if cid == cluster_id:
+                continue
+            s = _sim_for_cluster(cid)
+            n = counts.get(cid, 0)
+            rows.append({
+                "id": cid,
+                "similarity": round(s, 3),
+                "n_spikes": n,
+                "label": groups.get(cid, "unsorted"),
+                "amplitude": round(amplitudes.get(cid, 0.0), 1),
+                "fr": round(n / duration, 2),
+            })
+
+        rows.sort(key=lambda r: r["similarity"], reverse=True)
+        if limit > 0:
+            rows = rows[:limit]
+        return encode_response(primary_cluster_id=cluster_id, similar_clusters=rows)
 
     def _handle_label_cluster(self, req: dict) -> list[bytes]:
         """

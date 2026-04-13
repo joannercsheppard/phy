@@ -36,6 +36,7 @@ CMD_GET_SPIKE_DATA = "get_spike_data"        # (n_spikes, 2) float64: [time_s, a
 CMD_GET_CHANNEL_POSITIONS = "get_channel_positions"  # (n_channels, 2) float32: [x, y] µm
 CMD_GET_TRACES = "get_traces"                        # (n_ch, n_samples) float32 raw/HP traces
 CMD_GET_SPIKES_IN_WINDOW = "get_spikes_in_window"    # (n_spikes, 2) float64: [time, cluster_id]
+CMD_GET_SIMILAR_CLUSTERS = "get_similar_clusters"    # header-only ranked list for one cluster
 
 # ---------------------------------------------------------------------------
 # Encoding helpers

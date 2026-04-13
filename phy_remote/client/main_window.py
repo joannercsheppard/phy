@@ -48,6 +48,7 @@ from phy_remote.client.transport import PhyTransport, TransportError
 from phy_remote.client.views.waveform_view import WaveformWidget
 from phy_remote.client.views.isi_view import ISIWidget
 from phy_remote.client.views.amplitude_view import AmplitudeWidget
+from phy_remote.client.views.trace_view import TraceWidget
 
 logger = logging.getLogger(__name__)
 
@@ -294,23 +295,19 @@ class _FetchWorker(QObject):
         self._cancelled = True
 
     def run(self):
-        print(f"[FetchWorker] run() start clusters={self.cluster_ids}", flush=True)
         if not self.skip_templates:
             templates = {}
             for cid in self.cluster_ids:
                 if self._cancelled:
                     return
                 try:
-                    print(f"[FetchWorker] get_templates({cid}) …", flush=True)
-                    _, tmpl = self.transport.get_templates(cid)
-                    print(f"[FetchWorker] got template shape={tmpl.shape}", flush=True)
-                    templates[cid] = tmpl
+                    hdr, tmpl = self.transport.get_templates(cid)
+                    ch_ids = hdr.get("channel_ids", list(range(tmpl.shape[-1])))
+                    templates[cid] = (tmpl, ch_ids)
                 except Exception as exc:
-                    print(f"[FetchWorker] ERROR templates: {exc}", flush=True)
                     self.error.emit(f"Template fetch failed for cluster {cid}: {exc}")
                     return
             if not self._cancelled:
-                print(f"[FetchWorker] emitting template_ready", flush=True)
                 self.template_ready.emit(templates)
 
         # Stage 2: spike times + amplitudes (fast — all in RAM)
@@ -321,11 +318,9 @@ class _FetchWorker(QObject):
             try:
                 spike_data[cid] = self.transport.get_spike_data(cid)
             except Exception as exc:
-                print(f"[FetchWorker] ERROR spike_data: {exc}", flush=True)
                 self.error.emit(f"Spike data fetch failed for cluster {cid}: {exc}")
                 return
         if not self._cancelled:
-            print(f"[FetchWorker] emitting spike_data_ready", flush=True)
             self.spike_data_ready.emit(spike_data)
 
         # Stage 3: real waveforms (slow — disk read)
@@ -334,16 +329,13 @@ class _FetchWorker(QObject):
             if self._cancelled:
                 return
             try:
-                print(f"[FetchWorker] get_waveforms({cid}) …", flush=True)
-                _, w = self.transport.get_waveforms(cid, self.n_spikes)
-                print(f"[FetchWorker] got waveforms shape={w.shape}", flush=True)
-                waveforms[cid] = w
+                hdr, w = self.transport.get_waveforms(cid, self.n_spikes)
+                ch_ids = hdr.get("channel_ids", list(range(w.shape[-1])))
+                waveforms[cid] = (w, ch_ids)
             except Exception as exc:
-                print(f"[FetchWorker] ERROR waveforms: {exc}", flush=True)
                 self.error.emit(f"Waveform fetch failed for cluster {cid}: {exc}")
                 return
         if not self._cancelled:
-            print(f"[FetchWorker] emitting finished", flush=True)
             self.finished.emit(waveforms)
 
 
@@ -412,6 +404,10 @@ class MainWindow(QMainWindow):
         self._template_cache = _LRUCache(maxsize=30)
         self._waveform_cache = _LRUCache(maxsize=10)
         self._current_cluster_ids: list[int] = []
+        # home channel for each cluster (populated from template headers)
+        self._home_channels: dict[int, int] = {}
+        # spike times for each cluster (populated from spike_data)
+        self._spike_times: dict[int, np.ndarray] = {}
 
         self.setWindowTitle("phy-remote")
         self.resize(1400, 900)
@@ -438,6 +434,17 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(self._isi_dock, self._amp_dock)
         self._isi_dock.raise_()
 
+        # Right dock — trace view (shares the right column with waveforms)
+        self._trace_dock = QDockWidget("Traces", self)
+        self._trace_view = TraceWidget(
+            host=transport.host,
+            port=transport.port,
+            parent=self,
+        )
+        self._trace_dock.setWidget(self._trace_view)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._trace_dock)
+        self._trace_dock.hide()   # hidden until first cluster selected
+
         # Status bar + label buttons
         self._status_label = QLabel("Connecting…")
         status_bar = QStatusBar()
@@ -450,6 +457,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self._cluster_dock.toggleViewAction())
         view_menu.addAction(self._isi_dock.toggleViewAction())
         view_menu.addAction(self._amp_dock.toggleViewAction())
+        view_menu.addAction(self._trace_dock.toggleViewAction())
 
         # Keyboard shortcuts — labelling
         self._add_label_shortcut("g", "good")
@@ -461,7 +469,8 @@ class MainWindow(QMainWindow):
         self._add_nav_shortcut("j", +1)
         self._add_nav_shortcut("k", -1)
 
-        # Load cluster table
+        # Load channel positions then cluster table
+        self._load_channel_positions()
         self._load_cluster_info()
 
     # ------------------------------------------------------------------
@@ -510,6 +519,15 @@ class MainWindow(QMainWindow):
     # Startup
     # ------------------------------------------------------------------
 
+    def _load_channel_positions(self) -> None:
+        try:
+            positions = self.transport.get_channel_positions()
+            self._waveform_view.set_channel_positions(positions)
+            self._trace_view.set_channel_positions(positions)
+            logger.info("Loaded %d channel positions", len(positions))
+        except Exception as exc:
+            logger.warning("Could not load channel positions: %s", exc)
+
     def _load_cluster_info(self) -> None:
         self._set_status("Loading clusters…")
         try:
@@ -528,7 +546,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_clusters_selected(self, cluster_ids: list[int]) -> None:
-        print(f"[MainWindow] _on_clusters_selected {cluster_ids}", flush=True)
         self._current_cluster_ids = cluster_ids
 
         # Cancel any in-flight workers (they check _cancelled before emitting)
@@ -571,7 +588,6 @@ class MainWindow(QMainWindow):
         self._start_fetch(cluster_ids, skip_templates=False)
 
     def _start_fetch(self, cluster_ids: list[int], skip_templates: bool) -> None:
-        print(f"[MainWindow] _start_fetch {cluster_ids} skip={skip_templates}", flush=True)
         worker = _FetchWorker(
             self.transport, cluster_ids, self.n_spikes,
             skip_templates=skip_templates,
@@ -583,7 +599,6 @@ class MainWindow(QMainWindow):
         worker.error.connect(self._on_fetch_error)
         self._fetch_worker = worker
         threading.Thread(target=worker.run, daemon=True).start()
-        print(f"[MainWindow] fetch thread started", flush=True)
 
     def _start_prefetch(self, current_ids: list[int]) -> None:
         """Silently warm the template cache for adjacent clusters."""
@@ -603,42 +618,82 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_templates_ready(self, templates: dict) -> None:
-        print(f"[MainWindow] _on_templates_ready clusters={list(templates.keys())}", flush=True)
+        # templates: {cid: (array, ch_ids)}
         logger.info("Templates ready for clusters %s", list(templates.keys()))
-        for cid, tmpl in templates.items():
-            self._template_cache.put(cid, tmpl)
-        # Only update the view if this result is still relevant
+        for cid, (arr, ch_ids) in templates.items():
+            self._template_cache.put(cid, (arr, ch_ids))
+            # ch_ids[0] is the best (home) channel
+            if ch_ids:
+                self._home_channels[cid] = int(ch_ids[0])
         if set(templates.keys()) == set(self._current_cluster_ids):
             self._set_status(
                 f"Cluster(s) {self._fmt_ids(list(templates.keys()))}  — loading waveforms…"
             )
             self._waveform_view.set_waveforms(templates)
         else:
-            logger.info(
-                "Templates discarded (selection changed to %s)", self._current_cluster_ids
-            )
+            logger.info("Templates discarded (selection changed to %s)", self._current_cluster_ids)
+
+    # Tick colours (index 0 = primary/selected cluster)
+    _TICK_COLORS = [
+        (0.92, 0.15, 0.15, 1.0),
+        (0.15, 0.47, 0.90, 1.0),
+        (0.10, 0.72, 0.42, 1.0),
+        (0.92, 0.58, 0.08, 1.0),
+        (0.65, 0.15, 0.90, 1.0),
+    ]
 
     @pyqtSlot(dict)
     def _on_spike_data_ready(self, spike_data: dict) -> None:
         logger.info("Spike data ready for clusters %s", list(spike_data.keys()))
+        # Cache spike times
+        for cid, data in spike_data.items():
+            self._spike_times[cid] = data[:, 0].astype(np.float64)
+
         if set(spike_data.keys()) == set(self._current_cluster_ids):
             self._isi_view.set_spike_data(spike_data)
             self._amp_view.set_spike_data(spike_data)
+            self._update_trace_clusters(list(spike_data.keys()))
 
     @pyqtSlot(dict)
     def _on_waveforms_ready(self, waveforms: dict) -> None:
+        # waveforms: {cid: (array, ch_ids)}
         logger.info("Waveforms ready for clusters %s", list(waveforms.keys()))
-        for cid, w in waveforms.items():
-            self._waveform_cache.put(cid, w)
-        # Only update the view if this result is still relevant
+        for cid, val in waveforms.items():
+            self._waveform_cache.put(cid, val)
         if set(waveforms.keys()) == set(self._current_cluster_ids):
             self._set_status(f"Cluster(s) {self._fmt_ids(list(waveforms.keys()))}")
             self._waveform_view.set_waveforms(waveforms)
+            # Update trace overlays now that we have home channels confirmed
+            self._update_trace_clusters(list(waveforms.keys()))
             self._start_prefetch(self._current_cluster_ids)
         else:
-            logger.info(
-                "Waveforms discarded (selection changed to %s)", self._current_cluster_ids
-            )
+            logger.info("Waveforms discarded (selection changed to %s)", self._current_cluster_ids)
+
+    def _update_trace_clusters(self, cluster_ids: list[int]) -> None:
+        """Build cluster_data dict and push it to the trace view."""
+        cluster_data = {}
+        for idx, cid in enumerate(cluster_ids):
+            times   = self._spike_times.get(cid)
+            home_ch = self._home_channels.get(cid)
+            if times is None or home_ch is None:
+                continue
+            color = self._TICK_COLORS[idx % len(self._TICK_COLORS)]
+            cluster_data[cid] = (times, home_ch, color)
+
+        if not cluster_data:
+            return
+
+        self._trace_view.set_cluster_data(cluster_data)
+
+        # Show the trace dock and jump to first spike on first selection
+        if not self._trace_dock.isVisible():
+            self._trace_dock.show()
+            # Center on the first spike of the primary cluster
+            first_times = cluster_data[cluster_ids[0]][0]
+            if len(first_times):
+                self._trace_view.go_to_time(float(first_times[0]))
+            else:
+                self._trace_view.go_to_time(0.0)
 
     @pyqtSlot(str)
     def _on_fetch_error(self, msg: str) -> None:

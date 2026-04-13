@@ -31,6 +31,9 @@ from phy_remote.shared.protocol import (
     CMD_GET_CLUSTER_INFO,
     CMD_LABEL_CLUSTER,
     CMD_GET_SPIKE_DATA,
+    CMD_GET_CHANNEL_POSITIONS,
+    CMD_GET_TRACES,
+    CMD_GET_SPIKES_IN_WINDOW,
     decode_request,
     encode_response,
 )
@@ -148,6 +151,9 @@ class PhyServer:
             CMD_GET_CLUSTER_INFO: self._handle_get_cluster_info,
             CMD_LABEL_CLUSTER: self._handle_label_cluster,
             CMD_GET_SPIKE_DATA: self._handle_get_spike_data,
+            CMD_GET_CHANNEL_POSITIONS: self._handle_get_channel_positions,
+            CMD_GET_TRACES: self._handle_get_traces,
+            CMD_GET_SPIKES_IN_WINDOW: self._handle_get_spikes_in_window,
         }.get(cmd)
 
         if handler is None:
@@ -323,6 +329,115 @@ class PhyServer:
 
         data = np.column_stack([times, amps])   # (n_spikes, 2)
         return encode_response(array=data, cluster_id=cluster_id)
+
+    def _handle_get_traces(self, req: dict) -> list[bytes]:
+        """
+        Return raw (or high-pass filtered) voltage traces for a time window.
+
+        Request fields
+        --------------
+        t_start     : float  seconds
+        t_end       : float  seconds
+        channel_ids : list[int]  optional — all channels if omitted
+        filter      : bool  optional  high-pass filter at 300 Hz (default False)
+        max_samples : int   optional  downsample to at most this many columns
+                            (default 3000 — enough for a ~1000 px wide display)
+
+        Response array shape: (n_channels, n_samples) float32
+        Response header extras: sample_rate, t_start, t_end, channel_ids
+        """
+        self._require_model()
+        m = self.model
+        sr = float(m.sample_rate)
+
+        t_start = float(req["t_start"])
+        t_end   = float(req["t_end"])
+        channel_ids = req.get("channel_ids", None)
+        do_filter   = bool(req.get("filter", False))
+        max_samples = int(req.get("max_samples", 3000))
+
+        n_total = m.traces.shape[0]
+        s_start = max(0, int(t_start * sr))
+        s_end   = min(n_total, int(t_end * sr))
+        if s_start >= s_end:
+            return encode_response(status="error", error="empty time range")
+
+        # Read the trace chunk — force into a plain numpy array
+        chunk = np.array(m.traces[s_start:s_end], dtype=np.float32)  # (n_s, n_ch)
+        if channel_ids is not None:
+            chunk = chunk[:, list(channel_ids)]
+        else:
+            channel_ids = list(range(chunk.shape[1]))
+
+        chunk = chunk.T  # (n_ch, n_s) — channel-first for efficient wire transfer
+
+        # Optional high-pass filter (300 Hz, zero-phase)
+        if do_filter:
+            try:
+                from scipy.signal import butter, sosfiltfilt
+                sos = butter(3, 300.0 / (sr / 2.0), btype="high", output="sos")
+                chunk = sosfiltfilt(sos, chunk, axis=1).astype(np.float32)
+            except Exception as exc:
+                logger.warning("HP filter failed: %s", exc)
+
+        # Downsample for display if needed
+        n_s = chunk.shape[1]
+        if n_s > max_samples:
+            step = n_s // max_samples
+            chunk = chunk[:, ::step]
+            actual_t_end = t_start + (chunk.shape[1] * step) / sr
+        else:
+            actual_t_end = s_end / sr
+
+        actual_t_start = s_start / sr
+        return encode_response(
+            array=chunk,
+            sample_rate=sr,
+            t_start=actual_t_start,
+            t_end=actual_t_end,
+            channel_ids=list(channel_ids),
+        )
+
+    def _handle_get_spikes_in_window(self, req: dict) -> list[bytes]:
+        """
+        Return spike times and cluster ids within a time window.
+
+        Request fields
+        --------------
+        t_start     : float  seconds
+        t_end       : float  seconds
+        cluster_ids : list[int]  optional — if given, filter to these clusters
+
+        Response array shape: (n_spikes, 2) float64  [time_s, cluster_id]
+        """
+        self._require_model()
+        m = self.model
+        times    = m.spike_times
+        clusters = m.spike_clusters
+
+        t_start = float(req["t_start"])
+        t_end   = float(req["t_end"])
+
+        mask = (times >= t_start) & (times <= t_end)
+        if "cluster_ids" in req:
+            mask &= np.isin(clusters, req["cluster_ids"])
+
+        result = np.column_stack([
+            times[mask].astype(np.float64),
+            clusters[mask].astype(np.float64),
+        ]) if mask.any() else np.empty((0, 2), dtype=np.float64)
+
+        return encode_response(
+            array=result,
+            t_start=t_start,
+            t_end=t_end,
+        )
+
+    def _handle_get_channel_positions(self, req: dict) -> list[bytes]:
+        """Return probe channel positions as (n_channels, 2) float32 array [x, y] in µm."""
+        self._require_model()
+        positions = np.asarray(self.model.channel_positions, dtype=np.float32)
+        return encode_response(array=positions)
 
     def _handle_label_cluster(self, req: dict) -> list[bytes]:
         """

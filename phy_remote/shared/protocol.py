@@ -33,6 +33,9 @@ CMD_GET_CLUSTER_IDS = "get_cluster_ids"
 CMD_GET_CLUSTER_INFO = "get_cluster_info"   # all clusters: id, label, n_spikes, amplitude
 CMD_LABEL_CLUSTER = "label_cluster"          # set good/mua/noise/unsorted, save to disk
 CMD_GET_SPIKE_DATA = "get_spike_data"        # (n_spikes, 2) float64: [time_s, amplitude]
+CMD_GET_CHANNEL_POSITIONS = "get_channel_positions"  # (n_channels, 2) float32: [x, y] µm
+CMD_GET_TRACES = "get_traces"                        # (n_ch, n_samples) float32 raw/HP traces
+CMD_GET_SPIKES_IN_WINDOW = "get_spikes_in_window"    # (n_spikes, 2) float64: [time, cluster_id]
 
 # ---------------------------------------------------------------------------
 # Encoding helpers

@@ -31,6 +31,9 @@ from phy_remote.shared.protocol import (
     CMD_GET_CLUSTER_INFO,
     CMD_LABEL_CLUSTER,
     CMD_GET_SPIKE_DATA,
+    CMD_GET_CHANNEL_POSITIONS,
+    CMD_GET_TRACES,
+    CMD_GET_SPIKES_IN_WINDOW,
     encode_request,
     decode_response,
 )
@@ -179,6 +182,58 @@ class PhyTransport:
         """
         header, _ = self._call(CMD_GET_CLUSTER_INFO)
         return header["clusters"]
+
+    def get_traces(
+        self,
+        t_start: float,
+        t_end: float,
+        channel_ids: "list[int] | None" = None,
+        filtered: bool = False,
+        max_samples: int = 3000,
+    ) -> "tuple[np.ndarray, dict]":
+        """
+        Fetch raw (or HP-filtered) voltage traces for a time window.
+
+        Returns
+        -------
+        traces  : np.ndarray, shape (n_channels, n_samples), float32
+        header  : dict  with keys sample_rate, t_start, t_end, channel_ids
+        """
+        kwargs: dict = dict(t_start=t_start, t_end=t_end,
+                            filter=filtered, max_samples=max_samples)
+        if channel_ids is not None:
+            kwargs["channel_ids"] = channel_ids
+        header, array = self._call(CMD_GET_TRACES, **kwargs)
+        if array is None:
+            raise TransportError("server sent no array for get_traces")
+        return array, header
+
+    def get_spikes_in_window(
+        self,
+        t_start: float,
+        t_end: float,
+        cluster_ids: "list[int] | None" = None,
+    ) -> np.ndarray:
+        """
+        Fetch spike times and cluster ids in a time window.
+
+        Returns
+        -------
+        data : np.ndarray, shape (n_spikes, 2), float64
+            column 0 = spike time (s), column 1 = cluster_id
+        """
+        kwargs: dict = dict(t_start=t_start, t_end=t_end)
+        if cluster_ids is not None:
+            kwargs["cluster_ids"] = cluster_ids
+        _, array = self._call(CMD_GET_SPIKES_IN_WINDOW, **kwargs)
+        return array if array is not None else np.empty((0, 2), dtype=np.float64)
+
+    def get_channel_positions(self) -> np.ndarray:
+        """Return probe channel positions as (n_channels, 2) float32 array [x, y] µm."""
+        _, array = self._call(CMD_GET_CHANNEL_POSITIONS)
+        if array is None:
+            raise TransportError("server sent no array for get_channel_positions")
+        return array
 
     def get_spike_data(self, cluster_id: int) -> np.ndarray:
         """

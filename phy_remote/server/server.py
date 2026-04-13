@@ -35,6 +35,7 @@ from phy_remote.shared.protocol import (
     CMD_GET_TRACES,
     CMD_GET_SPIKES_IN_WINDOW,
     CMD_GET_SIMILAR_CLUSTERS,
+    CMD_GET_TEMPLATE_FEATURES,
     decode_request,
     encode_response,
 )
@@ -156,6 +157,7 @@ class PhyServer:
             CMD_GET_TRACES: self._handle_get_traces,
             CMD_GET_SPIKES_IN_WINDOW: self._handle_get_spikes_in_window,
             CMD_GET_SIMILAR_CLUSTERS: self._handle_get_similar_clusters,
+            CMD_GET_TEMPLATE_FEATURES: self._handle_get_template_features,
         }.get(cmd)
 
         if handler is None:
@@ -228,10 +230,27 @@ class PhyServer:
         self._require_model()
         cluster_id = int(req["cluster_id"])
         spike_ids = self.model.get_cluster_spikes(cluster_id)
-        features = self.model.get_features(spike_ids, None)
+        # Match Phy's behavior: use best channels for this cluster.
+        template = self.model.get_template(cluster_id)
+        channel_ids = template.channel_ids if template is not None else None
+        features = self.model.get_features(spike_ids, channel_ids)
         if features is None:
             return encode_response(status="error", error="no features available")
-        arr = np.asarray(features.data, dtype=np.float32)
+        arr = np.asarray(getattr(features, "data", features), dtype=np.float32)
+        ch_list = channel_ids.tolist() if channel_ids is not None else []
+        return encode_response(array=arr, cluster_id=cluster_id, channel_ids=ch_list)
+
+    def _handle_get_template_features(self, req: dict) -> list[bytes]:
+        """Return template_features for a cluster (KiloSort template_features.npy path)."""
+        self._require_model()
+        cluster_id = int(req["cluster_id"])
+        if not hasattr(self.model, "get_template_features"):
+            return encode_response(status="error", error="template features unavailable")
+        spike_ids = self.model.get_cluster_spikes(cluster_id)
+        tf = self.model.get_template_features(spike_ids)
+        if tf is None:
+            return encode_response(status="error", error="no template features available")
+        arr = np.asarray(tf, dtype=np.float32)
         return encode_response(array=arr, cluster_id=cluster_id)
 
     def _handle_get_templates(self, req: dict) -> list[bytes]:

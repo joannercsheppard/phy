@@ -35,6 +35,7 @@ from phy_remote.shared.protocol import (
     CMD_GET_TRACES,
     CMD_GET_SPIKES_IN_WINDOW,
     CMD_GET_SIMILAR_CLUSTERS,
+    CMD_GET_TEMPLATE_FEATURES,
     encode_request,
     decode_response,
 )
@@ -148,6 +149,20 @@ class PhyTransport:
         header, array = self._call(CMD_GET_FEATURES, cluster_id=cluster_id)
         if array is None:
             raise TransportError("server sent no array for get_features")
+        return header, array
+
+    def get_template_features(self, cluster_id: int) -> tuple[dict, np.ndarray]:
+        """
+        Fetch per-spike template features for *cluster_id*.
+
+        Returns
+        -------
+        header : dict
+        features : np.ndarray, float32
+        """
+        header, array = self._call(CMD_GET_TEMPLATE_FEATURES, cluster_id=cluster_id)
+        if array is None:
+            raise TransportError("server sent no array for get_template_features")
         return header, array
 
     def get_templates(self, cluster_id: int) -> tuple[dict, np.ndarray]:

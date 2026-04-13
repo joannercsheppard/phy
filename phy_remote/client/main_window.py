@@ -51,7 +51,7 @@ from phy_remote.client.views.amplitude_view import AmplitudeWidget
 from phy_remote.client.views.trace_view import TraceWidget
 from phy_remote.client.views.similarity_view import SimilarityWidget
 from phy_remote.client.views.template_features_view import TemplateFeaturesWidget
-from phy_remote.client.views.feature_cloud_view import FeatureCloudWidget
+from phy_remote.client.views.feature_cloud_view import FeatureViewWidget
 from phy_remote.client.views.probe_view import ProbeWidget
 from phy_remote.client.views.raster_view import RasterWidget
 from phy_remote.client.views.correlogram_view import CorrelogramWidget
@@ -281,6 +281,7 @@ class _FetchWorker(QObject):
     """
     template_ready   = pyqtSignal(dict)   # {cid: (n_samples, n_channels)}
     features_ready   = pyqtSignal(dict)   # {cid: features_array}
+    template_features_ready = pyqtSignal(dict)  # {cid: template_features_array}
     spike_data_ready = pyqtSignal(dict)   # {cid: (n_spikes, 2) [time, amp]}
     finished         = pyqtSignal(dict)   # {cid: (n_spikes, n_samples, n_channels)}
     error            = pyqtSignal(str)
@@ -330,6 +331,19 @@ class _FetchWorker(QObject):
                 logger.debug("Feature fetch skipped for cluster %d: %s", cid, exc)
         if not self._cancelled and features:
             self.features_ready.emit(features)
+
+        # Stage 1.6: template features (if available)
+        template_features = {}
+        for cid in self.cluster_ids:
+            if self._cancelled:
+                return
+            try:
+                _, tf = self.transport.get_template_features(cid)
+                template_features[cid] = tf
+            except Exception as exc:
+                logger.debug("Template features unavailable for cluster %d: %s", cid, exc)
+        if not self._cancelled and template_features:
+            self.template_features_ready.emit(template_features)
 
         # Stage 2: spike times + amplitudes (fast — all in RAM)
         spike_data = {}
@@ -431,6 +445,7 @@ class MainWindow(QMainWindow):
         # spike times for each cluster (populated from spike_data)
         self._spike_times: dict[int, np.ndarray] = {}
         self._features: dict[int, np.ndarray] = {}
+        self._template_features: dict[int, np.ndarray] = {}
 
         self.setWindowTitle("phy-remote")
         self.resize(1700, 950)
@@ -478,8 +493,8 @@ class MainWindow(QMainWindow):
         self._template_feat_dock.setWidget(self._template_feat_view)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._template_feat_dock)
 
-        self._feature_cloud_dock = QDockWidget("Feature cloud", self)
-        self._feature_cloud_view = FeatureCloudWidget(self)
+        self._feature_cloud_dock = QDockWidget("Feature view", self)
+        self._feature_cloud_view = FeatureViewWidget(self)
         self._feature_cloud_dock.setWidget(self._feature_cloud_view)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._feature_cloud_dock)
 
@@ -654,6 +669,9 @@ class MainWindow(QMainWindow):
     def _on_clusters_selected(self, cluster_ids: list[int]) -> None:
         self._current_cluster_ids = cluster_ids
         primary_cluster_id = cluster_ids[-1] if cluster_ids else None
+        # Reset feature-based panes; they will repopulate from model-backed RPCs.
+        self._feature_cloud_view.set_feature_data({})
+        self._template_feat_view.set_feature_data({})
 
         # Update similarity table from the last selected cluster (Phy behavior).
         if primary_cluster_id is not None:
@@ -712,6 +730,7 @@ class MainWindow(QMainWindow):
         if not skip_templates:
             worker.template_ready.connect(self._on_templates_ready)
         worker.features_ready.connect(self._on_features_ready)
+        worker.template_features_ready.connect(self._on_template_features_ready)
         worker.spike_data_ready.connect(self._on_spike_data_ready)
         worker.finished.connect(self._on_waveforms_ready)
         worker.error.connect(self._on_fetch_error)
@@ -757,8 +776,14 @@ class MainWindow(QMainWindow):
         for cid, arr in features.items():
             self._features[cid] = arr
         if set(features.keys()) == set(self._current_cluster_ids):
-            self._template_feat_view.set_feature_data(features)
             self._feature_cloud_view.set_feature_data(features)
+
+    @pyqtSlot(dict)
+    def _on_template_features_ready(self, template_features: dict) -> None:
+        for cid, arr in template_features.items():
+            self._template_features[cid] = arr
+        if set(template_features.keys()) == set(self._current_cluster_ids):
+            self._template_feat_view.set_feature_data(template_features)
 
     # Tick colours (index 0 = primary/selected cluster)
     _TICK_COLORS = [
@@ -868,6 +893,13 @@ class MainWindow(QMainWindow):
         for cid in self._current_cluster_ids:
             if cid in self._spike_times:
                 out[cid] = self._spike_times[cid]
+        return out
+
+    def _features_for_current(self) -> dict[int, np.ndarray]:
+        out = {}
+        for cid in self._current_cluster_ids:
+            if cid in self._features:
+                out[cid] = self._features[cid]
         return out
 
     def closeEvent(self, event) -> None:

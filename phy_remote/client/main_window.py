@@ -58,6 +58,7 @@ from phy_remote.client.views.correlogram_view import CorrelogramWidget
 from phy_remote.client.views.console_view import ConsoleWidget
 
 logger = logging.getLogger(__name__)
+_WAVEFORM_SPIKE_CAP = 100
 
 # ---------------------------------------------------------------------------
 # Label colours  (match phy conventions)
@@ -427,10 +428,10 @@ class MainWindow(QMainWindow):
     n_spikes  : int   max spikes to fetch per cluster for display
     """
 
-    def __init__(self, transport: PhyTransport, n_spikes: int = 50):
+    def __init__(self, transport: PhyTransport, n_spikes: int = 100):
         super().__init__()
         self.transport = transport
-        self.n_spikes = n_spikes
+        self.n_spikes = max(1, min(int(n_spikes), _WAVEFORM_SPIKE_CAP))
         self._fetch_worker:    _FetchWorker    | None = None
         self._prefetch_worker: _PrefetchWorker | None = None
 
@@ -451,9 +452,14 @@ class MainWindow(QMainWindow):
         self.resize(1700, 950)
         self.setDockNestingEnabled(True)
 
-        # Central widget — waveform view
-        self._waveform_view = WaveformWidget(max_spikes=n_spikes, parent=self)
-        self.setCentralWidget(self._waveform_view)
+        # Keep central as spacer; place waveform as an explicit dock.
+        self.setCentralWidget(QWidget(self))
+        self._waveform_dock = QDockWidget("Waveform", self)
+        self._waveform_view = WaveformWidget(max_spikes=self.n_spikes, parent=self)
+        self._waveform_dock.setWidget(self._waveform_view)
+        self._waveform_dock.setMinimumWidth(420)
+        self._waveform_dock.setMinimumHeight(240)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._waveform_dock)
 
         # Left dock — cluster table
         self._cluster_dock = _ClusterTableDock(self)
@@ -520,9 +526,10 @@ class MainWindow(QMainWindow):
 
         # Build a phy-like layout: left cluster table, middle waveform + top feature,
         # large right traces, and several small bottom analysis panes.
-        self.splitDockWidget(self._cluster_dock, self._template_feat_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(self._template_feat_dock, self._trace_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(self._cluster_dock, self._waveform_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(self._waveform_dock, self._trace_dock, Qt.Orientation.Horizontal)
         self.splitDockWidget(self._cluster_dock, self._similarity_dock, Qt.Orientation.Vertical)
+        self.splitDockWidget(self._waveform_dock, self._template_feat_dock, Qt.Orientation.Vertical)
         self.splitDockWidget(self._template_feat_dock, self._feature_cloud_dock, Qt.Orientation.Vertical)
 
         self.splitDockWidget(self._cluster_dock, self._isi_dock, Qt.Orientation.Vertical)
@@ -533,8 +540,8 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self._correlogram_dock, self._console_dock, Qt.Orientation.Horizontal)
 
         self.resizeDocks(
-            [self._cluster_dock, self._template_feat_dock, self._trace_dock],
-            [260, 680, 720],
+            [self._cluster_dock, self._waveform_dock, self._trace_dock],
+            [260, 760, 640],
             Qt.Orientation.Horizontal,
         )
         self.resizeDocks(
@@ -543,10 +550,12 @@ class MainWindow(QMainWindow):
             Qt.Orientation.Vertical,
         )
         self.resizeDocks(
-            [self._template_feat_dock, self._feature_cloud_dock],
-            [250, 700],
+            [self._waveform_dock, self._template_feat_dock, self._feature_cloud_dock],
+            [420, 220, 260],
             Qt.Orientation.Vertical,
         )
+        self._waveform_dock.show()
+        self._waveform_dock.raise_()
         self.resizeDocks(
             [
                 self._isi_dock, self._amp_dock, self._probe_dock,
@@ -568,6 +577,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self._cluster_dock.toggleViewAction())
         view_menu.addAction(self._isi_dock.toggleViewAction())
         view_menu.addAction(self._amp_dock.toggleViewAction())
+        view_menu.addAction(self._waveform_dock.toggleViewAction())
         view_menu.addAction(self._trace_dock.toggleViewAction())
         view_menu.addAction(self._similarity_dock.toggleViewAction())
         view_menu.addAction(self._template_feat_dock.toggleViewAction())
@@ -698,6 +708,9 @@ class MainWindow(QMainWindow):
 
         if len(cached_templates) == len(cluster_ids):
             # All templates in cache → show immediately
+            if not self._waveform_dock.isVisible():
+                self._waveform_dock.show()
+            self._waveform_dock.raise_()
             self._waveform_view.set_waveforms(cached_templates)
 
             # Check if real waveforms are also cached
@@ -767,6 +780,9 @@ class MainWindow(QMainWindow):
             self._set_status(
                 f"Cluster(s) {self._fmt_ids(list(templates.keys()))}  — loading waveforms…"
             )
+            if not self._waveform_dock.isVisible():
+                self._waveform_dock.show()
+            self._waveform_dock.raise_()
             self._waveform_view.set_waveforms(templates)
         else:
             logger.info("Templates discarded (selection changed to %s)", self._current_cluster_ids)

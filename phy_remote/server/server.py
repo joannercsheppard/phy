@@ -41,6 +41,7 @@ from phy_remote.shared.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+_TOP_WAVEFORM_CHANNELS = 10
 
 
 class PhyServer:
@@ -193,9 +194,11 @@ class PhyServer:
         cluster_id = int(req["cluster_id"])
         n_spikes = int(req.get("n_spikes", 50))
 
-        # Get the template's local channel_ids — typically 10-20 channels
-        template = self.model.get_template(cluster_id)
-        channel_ids = template.channel_ids if template is not None else None
+        # Get top channels for this cluster's dominant template.
+        _, ch_top = self._template_waveform_and_channels_for_cluster(
+            cluster_id, top_n=_TOP_WAVEFORM_CHANNELS
+        )
+        channel_ids = np.asarray(ch_top, dtype=np.int64) if ch_top else None
 
         spike_ids = self.model.get_cluster_spikes(cluster_id)
         if len(spike_ids) > n_spikes:
@@ -230,9 +233,11 @@ class PhyServer:
         self._require_model()
         cluster_id = int(req["cluster_id"])
         spike_ids = self.model.get_cluster_spikes(cluster_id)
-        # Match Phy's behavior: use best channels for this cluster.
-        template = self.model.get_template(cluster_id)
-        channel_ids = template.channel_ids if template is not None else None
+        # Match Phy's behavior: use top channels for this cluster.
+        _, ch_top = self._template_waveform_and_channels_for_cluster(
+            cluster_id, top_n=_TOP_WAVEFORM_CHANNELS
+        )
+        channel_ids = np.asarray(ch_top, dtype=np.int64) if ch_top else None
         features = self.model.get_features(spike_ids, channel_ids)
         if features is None:
             return encode_response(status="error", error="no features available")
@@ -266,14 +271,12 @@ class PhyServer:
         self._require_model()
         cluster_id = int(req["cluster_id"])
 
-        # TemplateModel exposes get_template() returning a Bunch with
-        # .template (n_samples, n_channels) and .channel_ids
-        template = self.model.get_template(cluster_id)
-        if template is None:
+        # Use dominant template + top channels (Phy-like best channels).
+        arr, channel_ids = self._template_waveform_and_channels_for_cluster(
+            cluster_id, top_n=_TOP_WAVEFORM_CHANNELS
+        )
+        if arr is None or channel_ids is None:
             return encode_response(status="error", error="no template available")
-
-        arr = np.asarray(template.template, dtype=np.float32)
-        channel_ids = template.channel_ids.tolist()
         return encode_response(array=arr, cluster_id=cluster_id, channel_ids=channel_ids)
 
     def _handle_get_cluster_ids(self, req: dict) -> list[bytes]:
@@ -586,6 +589,56 @@ class PhyServer:
     def _require_model(self) -> None:
         if self.model is None:
             raise RuntimeError("server started without a model")
+
+    def _best_template_for_cluster(self, cluster_id: int) -> int:
+        """
+        Return the dominant template id for a cluster.
+        Mirrors Phy's get_template_for_cluster behavior.
+        """
+        m = self.model
+        spike_ids = m.get_cluster_spikes(cluster_id)
+        if spike_ids is None or len(spike_ids) == 0:
+            raise RuntimeError(f"cluster {cluster_id} has no spikes")
+        if not hasattr(m, "spike_templates") or m.spike_templates is None:
+            # Fallback for unusual models where cluster ids == template ids.
+            return int(cluster_id)
+        st = np.asarray(m.spike_templates[spike_ids], dtype=np.int64)
+        template_ids, counts = np.unique(st, return_counts=True)
+        return int(template_ids[int(np.argmax(counts))])
+
+    def _best_channel_ids_for_cluster(self, cluster_id: int) -> "np.ndarray | None":
+        """
+        Return best channel ids for the dominant template of a cluster.
+        """
+        template_id = self._best_template_for_cluster(cluster_id)
+        template = self.model.get_template(int(template_id))
+        return template.channel_ids if template is not None else None
+
+    def _template_waveform_and_channels_for_cluster(
+        self, cluster_id: int, top_n: int = _TOP_WAVEFORM_CHANNELS
+    ) -> "tuple[np.ndarray | None, list[int] | None]":
+        """
+        Return template waveform restricted to top-N amplitude channels.
+        """
+        template_id = self._best_template_for_cluster(cluster_id)
+        template = self.model.get_template(int(template_id))
+        if template is None:
+            return None, None
+
+        wave = np.asarray(template.template, dtype=np.float32)  # (n_samples, n_ch_local)
+        ch_ids = np.asarray(template.channel_ids, dtype=np.int64)
+        if wave.ndim != 2 or len(ch_ids) != wave.shape[1]:
+            return None, None
+
+        # Rank channels by template peak-to-peak amplitude.
+        ptp = np.ptp(wave, axis=0)
+        order = np.argsort(ptp)[::-1]
+        k = min(max(1, int(top_n)), len(order))
+        keep = np.sort(order[:k])  # keep stable channel order for probe mapping
+
+        wave_top = wave[:, keep].astype(np.float32)
+        ch_top = ch_ids[keep].astype(np.int64).tolist()
+        return wave_top, ch_top
 
     def _handle_signal(self, signum, frame) -> None:
         logger.info("received signal %d, stopping", signum)

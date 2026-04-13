@@ -41,9 +41,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--n-spikes",
         type=int,
-        default=50,
+        default=100,
         metavar="N",
-        help="Max spikes to fetch per cluster for display (default: 50)",
+        help="Max spikes to fetch per cluster for display (default: 100)",
     )
     p.add_argument(
         "--log-level",

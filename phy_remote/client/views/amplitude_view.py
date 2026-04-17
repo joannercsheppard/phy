@@ -26,16 +26,8 @@ logger = logging.getLogger(__name__)
 _MAX_PTS   = 100_000   # max scatter points per cluster (AmplitudeTimeWidget)
 _PT_SIZE   = 2
 _ALPHA_SEL = 0.70      # selected cluster point alpha
-
-# TemplateAmplitudeWidget — label colours matching phy2 conventions
-_LABEL_RGBA: dict[str, np.ndarray] = {
-    "good":     np.array([0.22, 0.75, 0.38, 0.80], dtype=np.float32),   # green
-    "mua":      np.array([0.90, 0.55, 0.12, 0.80], dtype=np.float32),   # orange
-    "noise":    np.array([0.82, 0.22, 0.22, 0.80], dtype=np.float32),   # red
-    "unsorted": np.array([0.55, 0.55, 0.55, 0.55], dtype=np.float32),   # grey
-}
-_BASE_PT_SIZE = 4    # dots for all clusters
-_SEL_PT_SIZE  = 8    # highlighted dot for selected clusters
+_ALPHA_ALL = 0.55      # all-cluster point alpha (TemplateAmplitudeWidget)
+_GREY      = (0.45, 0.45, 0.45, 0.30)   # unselected cluster colour
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +207,10 @@ class AmplitudeTimeWidget(QWidget):
 # ---------------------------------------------------------------------------
 
 class TemplateAmplitudeWidget(QWidget):
-    """All-cluster scatter: amplitude (y) vs depth (x), coloured by label.
+    """Mean template amplitude vs. cluster rank for ALL clusters.
 
-    Mirrors phy2's ClusterScatterView:
-    - Every cluster is a dot coloured by its label (good/mua/noise/unsorted).
-    - Selected clusters are rendered on top in brighter cluster colours.
-    - Falls back to cluster index on x when depth is unavailable.
+    Grey points = all clusters ordered by amplitude (largest first).
+    Coloured points overlay the selected clusters at their rank position.
     """
 
     def __init__(self, parent=None):
@@ -229,7 +219,7 @@ class TemplateAmplitudeWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        hdr = QLabel("Amplitude vs depth")
+        hdr = QLabel("Template amplitudes")
         hdr.setFixedHeight(18)
         hdr.setStyleSheet(
             "background:#252525;color:#aaa;font-size:10px;"
@@ -237,12 +227,12 @@ class TemplateAmplitudeWidget(QWidget):
         )
         layout.addWidget(hdr)
 
-        self._fig:      object | None = None
-        self._sp:       object | None = None
-        self._sc_all:   object | None = None   # all-cluster scatter (label colours)
-        self._sc_sel:   object | None = None   # selected-cluster overlay
-        self._clusters: list[dict]    = []
-        self._selected: list[int]     = []
+        self._fig:       object | None = None
+        self._sp:        object | None = None
+        self._sc_all:    object | None = None   # grey scatter — all clusters
+        self._sc_sel:    object | None = None   # coloured scatter — selected
+        self._clusters:  list[dict]    = []
+        self._selected:  list[int]     = []
 
         self._fig, self._sp, _ = _make_fpl_subplot(layout, self)
         if self._fig is not None:
@@ -271,20 +261,15 @@ class TemplateAmplitudeWidget(QWidget):
             return
         sp = self._sp
 
-        has_depth = any("depth" in c for c in self._clusters)
+        # Sort all clusters by amplitude descending — rank = x axis
+        sorted_cl = sorted(self._clusters, key=lambda c: -c.get("amplitude", 0.0))
+        rank  = np.arange(len(sorted_cl), dtype=np.float32)
+        amps  = np.array([c.get("amplitude", 0.0) for c in sorted_cl], dtype=np.float32)
+        all_pts = np.column_stack([rank, amps])
 
-        # Build per-cluster (x, y) and colour from label
-        pts_list:   list[list[float]] = []
-        color_list: list[np.ndarray]  = []
-        for i, c in enumerate(self._clusters):
-            x = float(c["depth"]) if has_depth else float(i)
-            y = float(c.get("amplitude", 0.0))
-            pts_list.append([x, y])
-            lbl = c.get("label", "unsorted")
-            color_list.append(_LABEL_RGBA.get(lbl, _LABEL_RGBA["unsorted"]))
-
-        all_pts    = np.array(pts_list,  dtype=np.float32)
-        all_colors = np.array(color_list, dtype=np.float32)
+        # Grey background scatter — all clusters
+        grey = np.array(_GREY, dtype=np.float32)
+        grey_colors = np.broadcast_to(grey, (len(all_pts), 4)).copy()
 
         if self._sc_all is not None:
             try:
@@ -292,11 +277,11 @@ class TemplateAmplitudeWidget(QWidget):
             except Exception:
                 pass
         try:
-            self._sc_all = sp.add_scatter(all_pts, sizes=_BASE_PT_SIZE, colors=all_colors)
+            self._sc_all = sp.add_scatter(all_pts, sizes=_PT_SIZE + 1, colors=grey_colors)
         except Exception as exc:
             logger.warning("TemplateAmplitudeWidget add_scatter all: %s", exc)
 
-        # Selected overlay — brighter cluster colours on top
+        # Coloured overlay — selected clusters
         if self._sc_sel is not None:
             try:
                 safe_delete(sp, self._sc_sel)
@@ -305,23 +290,23 @@ class TemplateAmplitudeWidget(QWidget):
             self._sc_sel = None
 
         if self._selected:
-            id_to_cluster = {int(c["id"]): c for c in self._clusters}
-            sel_pts, sel_cols = [], []
+            sel_set = set(self._selected)
+            sel_pts, sel_colors = [], []
             for slot, cid in enumerate(self._selected):
-                c = id_to_cluster.get(int(cid))
-                if c is None:
-                    continue
-                x = float(c["depth"]) if has_depth else 0.0
-                y = float(c.get("amplitude", 0.0))
-                sel_pts.append([x, y])
-                sel_cols.append(list(cluster_color(slot, alpha=0.95)))
+                # Find rank of this cluster
+                for ri, c in enumerate(sorted_cl):
+                    if c["id"] == cid:
+                        sel_pts.append([float(ri), float(c.get("amplitude", 0.0))])
+                        rgba = list(cluster_color(slot, alpha=_ALPHA_ALL))
+                        sel_colors.append(rgba)
+                        break
 
             if sel_pts:
+                sel_arr    = np.array(sel_pts, dtype=np.float32)
+                sel_col_arr = np.array(sel_colors, dtype=np.float32)
                 try:
                     self._sc_sel = sp.add_scatter(
-                        np.array(sel_pts, dtype=np.float32),
-                        sizes=_SEL_PT_SIZE,
-                        colors=np.array(sel_cols, dtype=np.float32),
+                        sel_arr, sizes=_PT_SIZE + 4, colors=sel_col_arr
                     )
                 except Exception as exc:
                     logger.warning("TemplateAmplitudeWidget add_scatter sel: %s", exc)
@@ -331,11 +316,9 @@ class TemplateAmplitudeWidget(QWidget):
     def _fit(self) -> None:
         if self._fig is None or not self._clusters:
             return
-        has_depth = any("depth" in c for c in self._clusters)
-        xs = [float(c["depth"]) if has_depth else float(i)
-              for i, c in enumerate(self._clusters)]
-        ys = [float(c.get("amplitude", 0.0)) for c in self._clusters]
-        pts = np.array([[min(xs), min(ys)], [max(xs), max(ys)]], dtype=np.float32)
+        n = len(self._clusters)
+        amps = [c.get("amplitude", 0.0) for c in self._clusters]
+        pts = np.array([[0, min(amps)], [n - 1, max(amps)]], dtype=np.float32)
         _fit_camera(self._sp, pts, self._fig)
 
 

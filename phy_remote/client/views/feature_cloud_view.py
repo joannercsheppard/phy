@@ -101,74 +101,6 @@ def _points_in_polygon(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
     return inside
 
 
-_CROSSHAIR_HALF = 1e6   # large enough to span any reasonable data range
-
-
-# ---------------------------------------------------------------------------
-# Label grid overlay — dim labels inside each subplot
-# ---------------------------------------------------------------------------
-
-class _LabelGrid(QWidget):
-    """Transparent overlay that draws dim labels inside each subplot.
-
-    - Y-axis label: top-left corner of each cell (the "y" dimension).
-    - X-axis label: bottom-center of each cell (the "x" dimension).
-    """
-
-    def __init__(self, canvas: QWidget):
-        super().__init__(canvas)
-        self._canvas = canvas
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-
-        n = _N_ROWS * _N_COLS
-        self._ylbls: list[QLabel] = []
-        self._xlbls: list[QLabel] = []
-        for _ in range(n):
-            for lst in (self._ylbls, self._xlbls):
-                lbl = QLabel("", self)
-                lbl.setStyleSheet(
-                    "color:#999;font-size:8px;background:transparent;"
-                )
-                lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-                lst.append(lbl)
-
-        canvas.installEventFilter(self)
-        self.setGeometry(canvas.rect())
-        self.show()
-        self.raise_()
-
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        if obj is self._canvas and event.type() == QEvent.Type.Resize:
-            self.setGeometry(self._canvas.rect())
-            self._reposition()
-        return False
-
-    def set_labels(self, flat: "list[tuple[str,str]]") -> None:
-        """flat: [(dim_x_label, dim_y_label), …] length _N_ROWS*_N_COLS, row-major."""
-        for i, (xl, yl) in enumerate(flat[: _N_ROWS * _N_COLS]):
-            self._ylbls[i].setText(yl)
-            self._xlbls[i].setText(xl)
-        self._reposition()
-
-    def _reposition(self) -> None:
-        cw, ch = self._canvas.width(), self._canvas.height()
-        if cw <= 0 or ch <= 0:
-            return
-        sw, sh = cw / _N_COLS, ch / _N_ROWS
-        for i in range(_N_ROWS * _N_COLS):
-            r, c = divmod(i, _N_COLS)
-            x0, y0 = c * sw, r * sh
-            yl = self._ylbls[i]
-            xl = self._xlbls[i]
-            yl.adjustSize()
-            yl.move(int(x0 + 2), int(y0 + 1))
-            xl.adjustSize()
-            xl.move(int(x0 + (sw - xl.sizeHint().width()) / 2),
-                    int(y0 + sh - xl.sizeHint().height() - 1))
-
-
 # ---------------------------------------------------------------------------
 # Lasso overlay
 # ---------------------------------------------------------------------------
@@ -304,7 +236,6 @@ class FeatureViewWidget(QWidget):
         self._fig: object | None = None
         self._canvas: QWidget | None = None
         self._lasso_overlay: _LassoOverlay | None = None
-        self._label_grid:    _LabelGrid   | None = None
 
         # {(r, c, cid): scatter graphic}
         self._scatters: dict[tuple[int, int, int], object] = {}
@@ -359,9 +290,6 @@ class FeatureViewWidget(QWidget):
 
     def _init_fpl(self, fpl, layout: QVBoxLayout) -> None:
         self._fig = fpl.Figure(shape=(_N_ROWS, _N_COLS), canvas="qt")
-        _xhair_colors = np.array(
-            [[0.5, 0.5, 0.5, 0.35], [0.5, 0.5, 0.5, 0.35]], dtype=np.float32
-        )
         for r in range(_N_ROWS):
             for c in range(_N_COLS):
                 sp = self._fig[r, c]
@@ -375,16 +303,6 @@ class FeatureViewWidget(QWidget):
                     pass
                 try:
                     sp.title.visible = False
-                except Exception:
-                    pass
-                # Grey cross-hairs through the origin (data space)
-                try:
-                    h = float(_CROSSHAIR_HALF)
-                    lines = [
-                        np.array([[-h, 0.0], [h, 0.0]], dtype=np.float32),
-                        np.array([[0.0, -h], [0.0, h]], dtype=np.float32),
-                    ]
-                    sp.add_line_collection(lines, colors=_xhair_colors, thickness=0.8)
                 except Exception:
                     pass
 
@@ -401,8 +319,6 @@ class FeatureViewWidget(QWidget):
 
         self._lasso_overlay = _LassoOverlay(self._canvas, self._fig, self)
         self._lasso_overlay.spikes_selected.connect(self.spikes_selected)
-
-        self._label_grid = _LabelGrid(self._canvas)
 
     # ------------------------------------------------------------------
     # Public API  (compatible with existing main_window calls)
@@ -447,20 +363,6 @@ class FeatureViewWidget(QWidget):
             }
 
         self._cdata = new_cdata
-
-        # Update dim labels using first cluster's channel IDs
-        if new_cdata and self._label_grid is not None:
-            sample = next(iter(new_cdata.values()))
-            ch_ids = sample["ch_ids"]
-            flat = [
-                (self._label(_GRID[r][c][0], ch_ids),
-                 self._label(_GRID[r][c][1], ch_ids))
-                for r in range(_N_ROWS)
-                for c in range(_N_COLS)
-            ]
-            self._label_grid.set_labels(flat)
-        elif not new_cdata and self._label_grid is not None:
-            self._label_grid.set_labels([("", "")] * (_N_ROWS * _N_COLS))
 
         # Log what we received so mismatched shapes are easy to spot
         for cid, cdat in new_cdata.items():
@@ -741,50 +643,32 @@ class FeatureViewWidget(QWidget):
         QTimer.singleShot(50, self._auto_scale)
 
     def _auto_scale(self) -> None:
-        """Fit each subplot camera.
-
-        PC axes: symmetric around 0 (lim = max |value|, matching phy2).
-        Time axis: data-fitted with 5 % padding.
-        """
+        """Fit each subplot's camera to the bounding box of its scatter data."""
         if self._fig is None:
             return
         try:
             for r in range(_N_ROWS):
                 for c in range(_N_COLS):
                     sp = self._fig[r, c]
-                    dim_x, dim_y = _GRID[r][c]
-
+                    # Collect all points in this subplot
                     pts_list = []
                     for (kr, kc, _), sc in self._scatters.items():
                         if kr != r or kc != c:
                             continue
                         try:
-                            val = sc.data.value   # (N, 3)
+                            val = sc.data.value  # (N, 3)
                             pts_list.append(val[:, :2])
                         except Exception:
                             pass
                     if not pts_list:
                         continue
                     pts = np.concatenate(pts_list, axis=0)
-
-                    # X axis
-                    if dim_x == "time":
-                        x0, x1 = float(pts[:, 0].min()), float(pts[:, 0].max())
-                        dx = max(x1 - x0, 1e-6) * 1.05
-                        cx = (x0 + x1) / 2
-                    else:
-                        lim = max(float(np.abs(pts[:, 0]).max()), 1e-6) * 1.10
-                        dx, cx = lim * 2, 0.0
-
-                    # Y axis
-                    if dim_y == "time":
-                        y0, y1 = float(pts[:, 1].min()), float(pts[:, 1].max())
-                        dy = max(y1 - y0, 1e-6) * 1.05
-                        cy = (y0 + y1) / 2
-                    else:
-                        lim = max(float(np.abs(pts[:, 1]).max()), 1e-6) * 1.10
-                        dy, cy = lim * 2, 0.0
-
+                    x0, x1 = float(pts[:, 0].min()), float(pts[:, 0].max())
+                    y0, y1 = float(pts[:, 1].min()), float(pts[:, 1].max())
+                    # Add 10 % padding; guard against zero-range axes
+                    dx = max(x1 - x0, 1e-6) * 1.10
+                    dy = max(y1 - y0, 1e-6) * 1.10
+                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
                     state = sp.camera.get_state()
                     pos = state["position"].copy()
                     pos[0], pos[1] = cx, cy

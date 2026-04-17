@@ -105,11 +105,24 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("Failed to load model: %s", exc)
         sys.exit(1)
 
+    n_channels_dat = getattr(model, "n_channels_dat", "?")
+    dtype          = getattr(model, "dtype", "?")
+    hp_filtered    = getattr(model, "hp_filtered", "?")
+    dat_path       = getattr(model, "dat_path", None) or getattr(model, "path", "?")
+    traces_shape   = getattr(model, "traces", None)
+    traces_shape   = traces_shape.shape if traces_shape is not None else "?"
     logger.info(
-        "Model loaded: %d clusters, %d spikes, %d channels",
+        "Model loaded: %d clusters, %d spikes, %d probe channels",
         len(model.cluster_ids),
         len(model.spike_times),
         model.n_channels,
+    )
+    logger.info(
+        "Binary file: %s", dat_path
+    )
+    logger.info(
+        "Traces shape: %s  (n_channels_dat=%s, dtype=%s, hp_filtered=%s)",
+        traces_shape, n_channels_dat, dtype, hp_filtered,
     )
 
     # ------------------------------------------------------------------ #

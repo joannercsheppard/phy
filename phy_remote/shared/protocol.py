@@ -38,6 +38,11 @@ CMD_GET_TRACES = "get_traces"                        # (n_ch, n_samples) float32
 CMD_GET_SPIKES_IN_WINDOW = "get_spikes_in_window"    # (n_spikes, 2) float64: [time, cluster_id]
 CMD_GET_SIMILAR_CLUSTERS = "get_similar_clusters"    # header-only ranked list for one cluster
 CMD_GET_TEMPLATE_FEATURES = "get_template_features"  # per-spike template feature vectors
+CMD_GET_CLUSTER_BEST_CHANNELS = "get_cluster_best_channels"  # header: best_channels dict
+CMD_MERGE = "merge"         # merge cluster_ids → new cluster, returns new_cluster_id
+CMD_UNDO  = "undo"          # undo last merge/split
+CMD_REDO  = "redo"          # redo
+CMD_SAVE  = "save"          # write spike_clusters.npy + cluster_group.tsv to disk
 
 # ---------------------------------------------------------------------------
 # Encoding helpers

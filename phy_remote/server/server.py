@@ -36,6 +36,11 @@ from phy_remote.shared.protocol import (
     CMD_GET_SPIKES_IN_WINDOW,
     CMD_GET_SIMILAR_CLUSTERS,
     CMD_GET_TEMPLATE_FEATURES,
+    CMD_GET_CLUSTER_BEST_CHANNELS,
+    CMD_MERGE,
+    CMD_UNDO,
+    CMD_REDO,
+    CMD_SAVE,
     decode_request,
     encode_response,
 )
@@ -64,6 +69,17 @@ class PhyServer:
         self.model = model
         self.host = host
         self._running = False
+
+        # Undo/redo stacks for merge operations.
+        # Each entry: (spike_clusters_copy, cluster_groups_copy)
+        self._undo_stack: list[tuple[np.ndarray, dict]] = []
+        self._redo_stack: list[tuple[np.ndarray, dict]] = []
+
+        # Keep a writable copy of spike_clusters so merges are in-memory.
+        # We try to shadow the model attribute so all existing handlers pick
+        # up the merged version automatically.
+        if model is not None:
+            self._init_mutable_spike_clusters()
 
         self._ctx = zmq.Context()
         self._sock = self._ctx.socket(zmq.REP)
@@ -159,6 +175,11 @@ class PhyServer:
             CMD_GET_SPIKES_IN_WINDOW: self._handle_get_spikes_in_window,
             CMD_GET_SIMILAR_CLUSTERS: self._handle_get_similar_clusters,
             CMD_GET_TEMPLATE_FEATURES: self._handle_get_template_features,
+            CMD_GET_CLUSTER_BEST_CHANNELS: self._handle_get_cluster_best_channels,
+            CMD_MERGE: self._handle_merge,
+            CMD_UNDO:  self._handle_undo,
+            CMD_REDO:  self._handle_redo,
+            CMD_SAVE:  self._handle_save,
         }.get(cmd)
 
         if handler is None:
@@ -195,7 +216,7 @@ class PhyServer:
         n_spikes = int(req.get("n_spikes", 50))
 
         # Get top channels for this cluster's dominant template.
-        _, ch_top = self._template_waveform_and_channels_for_cluster(
+        _, ch_top, _ = self._template_waveform_and_channels_for_cluster(
             cluster_id, top_n=_TOP_WAVEFORM_CHANNELS
         )
         channel_ids = np.asarray(ch_top, dtype=np.int64) if ch_top else None
@@ -212,6 +233,18 @@ class PhyServer:
             return encode_response(status="error", error="no waveforms available")
 
         arr = np.asarray(waveforms, dtype=np.float32)
+
+        # Match phy's pre-display filtering: if the binary is not already
+        # HP-filtered, apply a 3rd-order Butterworth 150 Hz zero-phase HP
+        # filter along the time axis (axis=1), same as phy's add_default_filter.
+        if not getattr(self.model, "hp_filtered", True):
+            try:
+                from scipy.signal import butter, sosfiltfilt
+                sr = float(self.model.sample_rate)
+                sos = butter(3, 150.0 / (sr / 2.0), btype="high", output="sos")
+                arr = sosfiltfilt(sos, arr, axis=1).astype(np.float32)
+            except Exception as exc:
+                logger.warning("Waveform HP filter failed: %s", exc)
         ch_list = channel_ids.tolist() if channel_ids is not None else []
         return encode_response(
             array=arr,
@@ -234,7 +267,7 @@ class PhyServer:
         cluster_id = int(req["cluster_id"])
         spike_ids = self.model.get_cluster_spikes(cluster_id)
         # Match Phy's behavior: use top channels for this cluster.
-        _, ch_top = self._template_waveform_and_channels_for_cluster(
+        _, ch_top, _ = self._template_waveform_and_channels_for_cluster(
             cluster_id, top_n=_TOP_WAVEFORM_CHANNELS
         )
         channel_ids = np.asarray(ch_top, dtype=np.int64) if ch_top else None
@@ -246,17 +279,21 @@ class PhyServer:
         return encode_response(array=arr, cluster_id=cluster_id, channel_ids=ch_list)
 
     def _handle_get_template_features(self, req: dict) -> list[bytes]:
-        """Return template_features for a cluster (KiloSort template_features.npy path)."""
+        """Return template_features for a cluster (KiloSort template_features.npy path).
+
+        Returns available=False (no array) when template_features.npy is absent,
+        so the client can silently skip rather than treating it as an error.
+        """
         self._require_model()
         cluster_id = int(req["cluster_id"])
         if not hasattr(self.model, "get_template_features"):
-            return encode_response(status="error", error="template features unavailable")
+            return encode_response(available=False, cluster_id=cluster_id)
         spike_ids = self.model.get_cluster_spikes(cluster_id)
         tf = self.model.get_template_features(spike_ids)
         if tf is None:
-            return encode_response(status="error", error="no template features available")
+            return encode_response(available=False, cluster_id=cluster_id)
         arr = np.asarray(tf, dtype=np.float32)
-        return encode_response(array=arr, cluster_id=cluster_id)
+        return encode_response(array=arr, available=True, cluster_id=cluster_id)
 
     def _handle_get_templates(self, req: dict) -> list[bytes]:
         """
@@ -272,12 +309,15 @@ class PhyServer:
         cluster_id = int(req["cluster_id"])
 
         # Use dominant template + top channels (Phy-like best channels).
-        arr, channel_ids = self._template_waveform_and_channels_for_cluster(
+        arr, channel_ids, best_ch = self._template_waveform_and_channels_for_cluster(
             cluster_id, top_n=_TOP_WAVEFORM_CHANNELS
         )
         if arr is None or channel_ids is None:
             return encode_response(status="error", error="no template available")
-        return encode_response(array=arr, cluster_id=cluster_id, channel_ids=channel_ids)
+        return encode_response(
+            array=arr, cluster_id=cluster_id,
+            channel_ids=channel_ids, best_ch=best_ch,
+        )
 
     def _handle_get_cluster_ids(self, req: dict) -> list[bytes]:
         """Return the list of all cluster ids as a 1-D int32 array."""
@@ -303,9 +343,7 @@ class PhyServer:
         counts = {int(cid): int(np.sum(spike_clusters == cid)) for cid in cluster_ids}
 
         # labels / groups (good / mua / noise / unsorted)
-        groups = {}
-        if hasattr(m, 'cluster_groups') and m.cluster_groups:
-            groups = {int(k): str(v) for k, v in m.cluster_groups.items()}
+        groups = {int(k): str(v) for k, v in self._get_groups().items()}
 
         # mean amplitude per cluster (from spike amplitudes if available)
         amplitudes = {}
@@ -399,7 +437,7 @@ class PhyServer:
         if do_filter:
             try:
                 from scipy.signal import butter, sosfiltfilt
-                sos = butter(3, 300.0 / (sr / 2.0), btype="high", output="sos")
+                sos = butter(3, 150.0 / (sr / 2.0), btype="high", output="sos")
                 chunk = sosfiltfilt(sos, chunk, axis=1).astype(np.float32)
             except Exception as exc:
                 logger.warning("HP filter failed: %s", exc)
@@ -457,6 +495,23 @@ class PhyServer:
             t_end=t_end,
         )
 
+    def _handle_get_cluster_best_channels(self, req: dict) -> list[bytes]:
+        """
+        Return the single best (highest-amplitude) channel for every cluster.
+
+        Response header: best_channels = {str(cluster_id): best_ch_int, ...}
+        No array frame.
+        """
+        self._require_model()
+        best_channels: dict[str, int] = {}
+        for cid in self.model.cluster_ids:
+            _, _, best_ch = self._template_waveform_and_channels_for_cluster(
+                int(cid), top_n=1
+            )
+            if best_ch is not None:
+                best_channels[str(int(cid))] = int(best_ch)
+        return encode_response(best_channels=best_channels)
+
     def _handle_get_channel_positions(self, req: dict) -> list[bytes]:
         """Return probe channel positions as (n_channels, 2) float32 array [x, y] in µm."""
         self._require_model()
@@ -512,9 +567,7 @@ class PhyServer:
 
         # Precompute info table fields.
         counts = {int(cid): int(np.sum(spike_clusters == cid)) for cid in cluster_ids}
-        groups = {}
-        if hasattr(m, "cluster_groups") and m.cluster_groups:
-            groups = {int(k): str(v) for k, v in m.cluster_groups.items()}
+        groups = {int(k): str(v) for k, v in self._get_groups().items()}
         amplitudes = {}
         if hasattr(m, "amplitudes") and m.amplitudes is not None:
             for cid in cluster_ids:
@@ -545,7 +598,8 @@ class PhyServer:
 
     def _handle_label_cluster(self, req: dict) -> list[bytes]:
         """
-        Set the label for one or more clusters and save to disk.
+        Set the label for one or more clusters (in memory only — not saved to disk).
+        Call CMD_SAVE to persist changes.
 
         Request fields
         --------------
@@ -568,23 +622,289 @@ class PhyServer:
             cluster_ids = [int(req["cluster_id"])]
 
         m = self.model
-        if not hasattr(m, 'cluster_groups') or m.cluster_groups is None:
-            m.cluster_groups = {}
+        groups = self._get_groups()
         for cid in cluster_ids:
-            m.cluster_groups[cid] = label
+            groups[cid] = label
 
-        # Persist: phy uses save_metadata to write cluster_group.tsv
-        if hasattr(m, 'save_metadata'):
-            m.save_metadata("group", m.cluster_groups)
-        elif hasattr(m, 'save'):
-            m.save()
-
-        logger.info("Labelled cluster(s) %s as %r", cluster_ids, label)
+        logger.info("Labelled cluster(s) %s as %r (unsaved)", cluster_ids, label)
         return encode_response(cluster_ids=cluster_ids, label=label)
+
+    def _handle_merge(self, req: dict) -> list[bytes]:
+        """
+        Merge two or more clusters into a new cluster.
+
+        Request fields
+        --------------
+        cluster_ids : list[int]  (must have at least 2 entries)
+
+        Response
+        --------
+        new_cluster_id : int
+        merged_ids     : list[int]
+        clusters       : list[dict]  updated cluster info (same format as GET_CLUSTER_INFO)
+        """
+        self._require_model()
+        cluster_ids = [int(c) for c in req.get("cluster_ids", [])]
+        if len(cluster_ids) < 2:
+            return encode_response(status="error", error="need at least 2 clusters to merge")
+
+        # Always work with a guaranteed-writeable array stored in __dict__
+        sc = self._get_mutable_spike_clusters()
+        existing = set(np.unique(sc).tolist())
+        missing = [c for c in cluster_ids if c not in existing]
+        if missing:
+            return encode_response(status="error", error=f"clusters not found: {missing}")
+
+        # Save state for undo
+        groups = self._get_groups()
+        self._undo_stack.append((sc.copy(), dict(groups)))
+        self._redo_stack.clear()
+
+        # New cluster id is max existing + 1
+        new_id = int(np.max(sc)) + 1
+
+        # Inherit label from the largest source cluster
+        best_label = "unsorted"
+        best_count = 0
+        for cid in cluster_ids:
+            n = int(np.sum(sc == cid))
+            if n > best_count:
+                best_count = n
+                best_label = groups.get(cid, "unsorted")
+
+        # Reassign spikes in our mutable copy
+        mask = np.isin(sc, cluster_ids)
+        sc[mask] = new_id
+
+        # Update the live groups dict
+        for cid in cluster_ids:
+            groups.pop(cid, None)
+        groups[new_id] = best_label
+
+        logger.info("Merged clusters %s → %d", cluster_ids, new_id)
+        clusters = self._build_cluster_info()
+        return encode_response(new_cluster_id=new_id, merged_ids=cluster_ids, clusters=clusters)
+
+    def _handle_undo(self, req: dict) -> list[bytes]:
+        """Undo the last merge. Returns updated cluster info."""
+        self._require_model()
+        if not self._undo_stack:
+            return encode_response(status="error", error="nothing to undo")
+
+        sc_now = self._get_mutable_spike_clusters()
+        self._redo_stack.append((sc_now.copy(), dict(self._get_groups())))
+
+        sc_prev, groups_prev = self._undo_stack.pop()
+        sc_now[:] = sc_prev
+        self._get_groups().clear()
+        self._get_groups().update(groups_prev)
+
+        logger.info("Undo: restored spike_clusters")
+        clusters = self._build_cluster_info()
+        return encode_response(clusters=clusters)
+
+    def _handle_redo(self, req: dict) -> list[bytes]:
+        """Redo the last undone merge. Returns updated cluster info."""
+        self._require_model()
+        if not self._redo_stack:
+            return encode_response(status="error", error="nothing to redo")
+
+        sc_now = self._get_mutable_spike_clusters()
+        self._undo_stack.append((sc_now.copy(), dict(self._get_groups())))
+
+        sc_next, groups_next = self._redo_stack.pop()
+        sc_now[:] = sc_next
+        self._get_groups().clear()
+        self._get_groups().update(groups_next)
+
+        logger.info("Redo: restored spike_clusters")
+        clusters = self._build_cluster_info()
+        return encode_response(clusters=clusters)
+
+    def _handle_save(self, req: dict) -> list[bytes]:
+        """
+        Persist spike_clusters.npy and cluster_group.tsv to the dataset directory.
+        """
+        self._require_model()
+        m = self.model
+        dir_path = None
+        for attr in ("dir_path", "dat_path"):
+            if hasattr(m, attr) and getattr(m, attr) is not None:
+                import pathlib
+                p = pathlib.Path(getattr(m, attr))
+                dir_path = p.parent if p.is_file() else p
+                break
+
+        if dir_path is None:
+            return encode_response(status="error", error="cannot determine dataset directory")
+
+        import pathlib
+        dir_path = pathlib.Path(dir_path)
+
+        # spike_clusters.npy
+        try:
+            np.save(str(dir_path / "spike_clusters.npy"), m.spike_clusters)
+        except Exception as exc:
+            logger.warning("Could not save spike_clusters.npy: %s", exc)
+
+        # cluster_group.tsv  (via model if possible, fallback to manual write)
+        saved_via_model = False
+        if hasattr(m, 'save_metadata'):
+            try:
+                groups = self._get_groups()
+                m.save_metadata("group", groups)
+                saved_via_model = True
+            except Exception as exc:
+                logger.warning("save_metadata failed, falling back: %s", exc)
+
+        if not saved_via_model:
+            try:
+                groups = self._get_groups()
+                tsv_path = dir_path / "cluster_group.tsv"
+                with open(tsv_path, "w") as f:
+                    f.write("cluster_id\tgroup\n")
+                    for cid, grp in sorted(groups.items()):
+                        f.write(f"{cid}\t{grp}\n")
+            except Exception as exc:
+                return encode_response(status="error", error=f"could not write cluster_group.tsv: {exc}")
+
+        logger.info("Saved clustering to %s", dir_path)
+        return encode_response(saved=True)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _get_groups(self) -> dict:
+        """Return the live {cluster_id (int): label (str)} dict.
+
+        Uses model.metadata['group'] as the canonical in-memory store so that
+        it stays in sync with phylib's own machinery.  Falls back to a plain
+        dict attached to the model when metadata is unavailable.
+        """
+        m = self.model
+        if hasattr(m, 'metadata') and isinstance(m.metadata, dict):
+            if 'group' not in m.metadata:
+                m.metadata['group'] = {}
+            return m.metadata['group']
+        # Fallback: use a plain dict attached to the model instance
+        if not hasattr(m, '_phy_remote_groups'):
+            m._phy_remote_groups = {}
+        return m._phy_remote_groups
+
+    def _save_cluster_groups(self) -> None:
+        """Write cluster labels to cluster_group.tsv.
+
+        Strategy (in order):
+          1. Call model.save_metadata("group", ...) — phylib's native method.
+          2. Write cluster_group.tsv directly next to the data file.
+
+        Both paths are attempted so the file is always written even if phylib's
+        method exists but fails internally.
+        """
+        groups = {int(k): str(v) for k, v in self._get_groups().items()}
+
+        # --- attempt 1: phylib's native save ---
+        native_ok = False
+        if hasattr(m, 'save_metadata'):
+            try:
+                m.save_metadata("group", groups)
+                native_ok = True
+                logger.debug("Labels saved via save_metadata (%d clusters)", len(groups))
+            except Exception as exc:
+                logger.warning("save_metadata failed (%s), falling back to direct write", exc)
+
+        # --- attempt 2: write TSV ourselves ---
+        # Resolve the dataset directory from the model's known path attributes.
+        dir_path = None
+        for attr in ("dir_path", "dat_path", "path"):
+            val = getattr(m, attr, None)
+            if val is not None:
+                import pathlib
+                p = pathlib.Path(val)
+                dir_path = p.parent if p.suffix else p
+                break
+
+        if dir_path is None:
+            # Last resort: look for params.py location via __file__ attribute
+            if hasattr(m, 'params_path'):
+                import pathlib
+                dir_path = pathlib.Path(m.params_path).parent
+
+        if dir_path is not None:
+            import pathlib
+            tsv_path = pathlib.Path(dir_path) / "cluster_group.tsv"
+            try:
+                with open(tsv_path, "w") as f:
+                    f.write("cluster_id\tgroup\n")
+                    for cid, grp in sorted(groups.items()):
+                        f.write(f"{cid}\t{grp}\n")
+                logger.debug("Labels written directly to %s (%d clusters)", tsv_path, len(groups))
+            except Exception as exc:
+                logger.error("Could not write cluster_group.tsv: %s", exc)
+        elif not native_ok:
+            logger.error(
+                "Labels NOT saved: save_metadata unavailable and dataset directory unknown"
+            )
+
+    def _get_mutable_spike_clusters(self) -> np.ndarray:
+        """Return the writeable spike_clusters array stored in the model's __dict__.
+
+        If it was never installed (e.g. init failed) we install it now so that
+        the first merge still works.
+        """
+        sc = self.model.__dict__.get('spike_clusters')
+        if sc is None or not isinstance(sc, np.ndarray) or not sc.flags.writeable:
+            self._init_mutable_spike_clusters()
+            sc = self.model.__dict__.get('spike_clusters')
+        if sc is None:
+            # Absolute fallback: copy from the model property each time
+            sc = np.array(self.model.spike_clusters)
+            self.model.__dict__['spike_clusters'] = sc
+        return sc
+
+    def _init_mutable_spike_clusters(self) -> None:
+        """Replace model.spike_clusters with a writable numpy array copy.
+
+        Handles three cases:
+          1. Regular instance attribute (memmap or ndarray) — set via instance dict.
+          2. Read-only property — set via instance __dict__ to shadow it.
+          3. Both fail — warn and carry on (merge will still attempt the copy trick).
+        """
+        try:
+            sc = np.array(self.model.spike_clusters)   # always a writeable plain array
+            # Set via __dict__ to bypass any property descriptor
+            self.model.__dict__['spike_clusters'] = sc
+            logger.debug("Installed mutable spike_clusters copy (%d spikes)", len(sc))
+        except Exception as exc:
+            logger.warning("Could not install mutable spike_clusters: %s", exc)
+
+    def _build_cluster_info(self) -> list[dict]:
+        """Return the same cluster summary as _handle_get_cluster_info."""
+        m = self.model
+        sc = m.spike_clusters
+        cluster_ids = np.unique(sc).tolist()
+        counts = {int(cid): int(np.sum(sc == cid)) for cid in cluster_ids}
+        groups = {int(k): str(v) for k, v in self._get_groups().items()}
+        amplitudes = {}
+        if hasattr(m, 'amplitudes') and m.amplitudes is not None:
+            for cid in cluster_ids:
+                mask = sc == cid
+                if mask.any():
+                    amplitudes[int(cid)] = float(np.mean(m.amplitudes[mask]))
+        duration = float(m.spike_times[-1]) if len(m.spike_times) else 1.0
+        clusters = []
+        for cid in cluster_ids:
+            cid = int(cid)
+            n = counts.get(cid, 0)
+            clusters.append({
+                "id": cid,
+                "label": groups.get(cid, "unsorted"),
+                "n_spikes": n,
+                "amplitude": round(amplitudes.get(cid, 0.0), 1),
+                "fr": round(n / duration, 2),
+            })
+        return clusters
 
     def _require_model(self) -> None:
         if self.model is None:
@@ -638,7 +958,9 @@ class PhyServer:
 
         wave_top = wave[:, keep].astype(np.float32)
         ch_top = ch_ids[keep].astype(np.int64).tolist()
-        return wave_top, ch_top
+        # Also expose the single best (highest-amplitude) channel id
+        best_ch = int(ch_ids[order[0]])
+        return wave_top, ch_top, best_ch
 
     def _handle_signal(self, signum, frame) -> None:
         logger.info("received signal %d, stopping", signum)

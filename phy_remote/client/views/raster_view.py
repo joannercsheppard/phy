@@ -1,22 +1,18 @@
-"""Raster view — spike-time raster for selected clusters."""
+"""Raster view — spike-time raster per cluster (fastplotlib)."""
 from __future__ import annotations
 
-import io
 import logging
 
 import numpy as np
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
+
+from phy_remote.client.views._zoom import install_zoom_filter
+from phy_remote.client.views._colors import cluster_color
+from phy_remote.client.views._graphics import safe_delete
 
 logger = logging.getLogger(__name__)
-
-_COLORS = [
-    (0.92, 0.15, 0.15),
-    (0.15, 0.47, 0.90),
-    (0.10, 0.72, 0.42),
-    (0.92, 0.58, 0.08),
-]
+_MAX_POINTS = 5_000
 
 
 class RasterWidget(QWidget):
@@ -24,59 +20,95 @@ class RasterWidget(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self._label = QLabel("Select a cluster")
-        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._label.setStyleSheet("background:#1e1e1e; color:#aaaaaa; font-size:12px;")
-        layout.addWidget(self._label)
+
+        self._fig = None
+        self._subplot = None
+        self._scatter_graphics: dict[int, object] = {}
+        self._cid_to_slot: dict[int, int] = {}
+
+        try:
+            import fastplotlib as fpl
+            self._fig = fpl.Figure(canvas="qt")
+            self._subplot = self._fig[0, 0]
+            try:
+                self._subplot.camera = "2d"
+                self._subplot.axes.visible = False
+                self._subplot.title.visible = False
+            except Exception:
+                pass
+            self._fig.show()
+            canvas = self._fig.canvas
+            canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            canvas.setMinimumSize(160, 120)
+            layout.addWidget(canvas)
+            self._zoom_filter = install_zoom_filter(self._fig, [self._subplot], self)
+        except Exception as exc:
+            logger.warning("RasterWidget: fastplotlib init failed: %s", exc)
 
     def set_spike_times(self, spike_times: dict[int, np.ndarray]) -> None:
-        if not spike_times:
-            self._label.setText("No spikes")
-            self._label.setPixmap(QPixmap())
+        if self._fig is None or not spike_times:
             return
         try:
-            pm = self._render(spike_times)
-            self._label.setPixmap(pm.scaled(
-                self._label.width(), self._label.height(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
+            self._render(spike_times)
         except Exception as exc:
-            logger.exception("Raster render failed")
-            self._label.setText(f"Raster error:\n{exc}")
+            logger.exception("RasterWidget render failed: %s", exc)
 
-    def _render(self, spike_times: dict[int, np.ndarray]) -> QPixmap:
-        import matplotlib
-        matplotlib.use("Agg")
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
+    def _render(self, spike_times: dict[int, np.ndarray]) -> None:
+        sp = self._subplot
 
-        fig = Figure(figsize=(3.6, 2.2), facecolor="#1e1e1e")
-        fig.subplots_adjust(left=0.12, right=0.97, top=0.88, bottom=0.18)
-        ax = fig.add_subplot(1, 1, 1)
-        ax.set_facecolor("#2a2a2a")
-        ax.set_title("Raster", color="#ccc", fontsize=9, pad=4)
-        ax.set_xlabel("Time (s)", color="#aaa", fontsize=8)
-        ax.tick_params(colors="#aaa", labelsize=7)
-        for spine in ax.spines.values():
-            spine.set_color("#555")
+        for cid in list(self._scatter_graphics.keys()):
+            if cid not in spike_times:
+                safe_delete(sp, self._scatter_graphics.pop(cid))
+                self._cid_to_slot.pop(cid, None)
 
-        for i, (cid, times) in enumerate(spike_times.items()):
-            t = np.asarray(times, dtype=np.float64)
-            if len(t) > 4000:
+        for idx, (cid, times) in enumerate(spike_times.items()):
+            t = np.asarray(times, dtype=np.float32)
+            n = len(t)
+            if n > _MAX_POINTS:
                 rng = np.random.default_rng(seed=cid)
-                sel = rng.choice(len(t), 4000, replace=False)
+                sel = rng.choice(n, _MAX_POINTS, replace=False)
                 t = np.sort(t[sel])
-            y = np.full(len(t), i + 1, dtype=np.float32)
-            c = _COLORS[i % len(_COLORS)]
-            ax.scatter(t, y, s=2, color=c, alpha=0.8, linewidths=0, rasterized=True)
+            y = np.full(len(t), float(idx + 1), dtype=np.float32)
+            xy = np.column_stack([t, y]).astype(np.float32)
+            rgba = np.array(cluster_color(idx, alpha=0.8), dtype=np.float32)
+            colors_arr = np.broadcast_to(rgba, (len(xy), 4)).copy()
 
-        ax.set_yticks(np.arange(1, len(spike_times) + 1))
-        ax.set_yticklabels([str(cid) for cid in spike_times.keys()], color="#aaa", fontsize=7)
+            slot_changed = self._cid_to_slot.get(cid) != idx
+            if cid in self._scatter_graphics and not slot_changed:
+                sc = self._scatter_graphics[cid]
+                if sc.data.value.shape[0] == len(xy):
+                    xyz = np.zeros((len(xy), 3), dtype=np.float32)
+                    xyz[:, :2] = xy
+                    sc.data[:] = xyz
+                else:
+                    safe_delete(sp, sc)
+                    self._scatter_graphics[cid] = sp.add_scatter(xy, sizes=2, colors=colors_arr)
+            else:
+                if cid in self._scatter_graphics:
+                    safe_delete(sp, self._scatter_graphics.pop(cid))
+                self._scatter_graphics[cid] = sp.add_scatter(xy, sizes=2, colors=colors_arr)
+            self._cid_to_slot[cid] = idx
 
-        buf = io.BytesIO()
-        FigureCanvasAgg(fig).print_png(buf)
-        import matplotlib.pyplot as plt
-        plt.close(fig)
-        buf.seek(0)
-        return QPixmap.fromImage(QImage.fromData(buf.read()))
+        QTimer.singleShot(50, self._auto_scale)
+
+    def _auto_scale(self) -> None:
+        if self._fig is None:
+            return
+        try:
+            sp = self._subplot
+            sp.auto_scale()
+            state = sp.camera.get_state()
+            pos = state['position'].copy()
+            pos[2] = state['depth'] / 2
+            sp.camera.set_state({
+                'position':        pos,
+                'fov':             0.0,
+                'width':           abs(state['width'])  * 1.1,
+                'height':          abs(state['height']) * 1.1,
+                'depth':           state['depth'],
+                'zoom':            1.0,
+                'maintain_aspect': False,
+            })
+            self._fig.canvas.request_draw()
+        except Exception as exc:
+            logger.debug("RasterWidget auto_scale: %s", exc)

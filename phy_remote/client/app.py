@@ -41,9 +41,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--n-spikes",
         type=int,
-        default=100,
+        default=500,
         metavar="N",
-        help="Max spikes to fetch per cluster for display (default: 100)",
+        help="Max spikes to fetch per cluster for display (default: 500)",
     )
     p.add_argument(
         "--log-level",
@@ -109,8 +109,16 @@ def main(argv: list[str] | None = None) -> None:
 
     exit_code = app.exec()
 
+    # Close ZMQ transport before the process exits.
     transport.close()
-    sys.exit(exit_code)
+
+    # Bypass Python/Qt cleanup to avoid a rendercanvas crash:
+    # rendercanvas connects an aboutToQuit handler that accesses the
+    # QRenderWidget C++ object, but by the time aboutToQuit fires Qt has
+    # already scheduled those objects for deletion via deleteLater().
+    # os._exit() terminates immediately without running atexit/Qt cleanup.
+    import os
+    os._exit(exit_code or 0)
 
 
 if __name__ == "__main__":

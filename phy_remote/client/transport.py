@@ -36,6 +36,11 @@ from phy_remote.shared.protocol import (
     CMD_GET_SPIKES_IN_WINDOW,
     CMD_GET_SIMILAR_CLUSTERS,
     CMD_GET_TEMPLATE_FEATURES,
+    CMD_GET_CLUSTER_BEST_CHANNELS,
+    CMD_MERGE,
+    CMD_UNDO,
+    CMD_REDO,
+    CMD_SAVE,
     encode_request,
     decode_response,
 )
@@ -151,16 +156,16 @@ class PhyTransport:
             raise TransportError("server sent no array for get_features")
         return header, array
 
-    def get_template_features(self, cluster_id: int) -> tuple[dict, np.ndarray]:
+    def get_template_features(self, cluster_id: int) -> tuple[dict, np.ndarray] | None:
         """
         Fetch per-spike template features for *cluster_id*.
 
-        Returns
-        -------
-        header : dict
-        features : np.ndarray, float32
+        Returns (header, array) on success, or None if the dataset has no
+        template_features.npy (server sets available=False).
         """
         header, array = self._call(CMD_GET_TEMPLATE_FEATURES, cluster_id=cluster_id)
+        if not header.get("available", True):
+            return None
         if array is None:
             raise TransportError("server sent no array for get_template_features")
         return header, array
@@ -266,6 +271,12 @@ class PhyTransport:
             raise TransportError("server sent no array for get_channel_positions")
         return array
 
+    def get_cluster_best_channels(self) -> "dict[int, int]":
+        """Return {cluster_id: best_channel_index} for every cluster."""
+        header, _ = self._call(CMD_GET_CLUSTER_BEST_CHANNELS)
+        raw = header.get("best_channels", {})
+        return {int(k): int(v) for k, v in raw.items()}
+
     def get_spike_data(self, cluster_id: int) -> np.ndarray:
         """
         Fetch per-spike times and amplitudes for *cluster_id*.
@@ -280,6 +291,31 @@ class PhyTransport:
         if array is None:
             raise TransportError("server sent no array for get_spike_data")
         return array
+
+    def merge_clusters(self, cluster_ids: "list[int]") -> dict:
+        """
+        Merge two or more clusters into a new one.
+
+        Returns
+        -------
+        header : dict  with keys new_cluster_id, merged_ids, clusters
+        """
+        header, _ = self._call(CMD_MERGE, cluster_ids=[int(c) for c in cluster_ids])
+        return header
+
+    def undo(self) -> dict:
+        """Undo the last merge. Returns header with 'clusters' list."""
+        header, _ = self._call(CMD_UNDO)
+        return header
+
+    def redo(self) -> dict:
+        """Redo the last undone merge. Returns header with 'clusters' list."""
+        header, _ = self._call(CMD_REDO)
+        return header
+
+    def save(self) -> None:
+        """Save spike_clusters.npy and cluster_group.tsv to disk on the server."""
+        self._call(CMD_SAVE)
 
     def label_cluster(
         self, cluster_ids: "int | list[int]", label: str

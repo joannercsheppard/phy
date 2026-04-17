@@ -14,13 +14,20 @@ Layout
 |  Status bar   [label buttons: g  m  n  u]        |
 +--------------------------------------------------+
 
-Keyboard shortcuts (when cluster table has focus or anywhere):
-  g  →  label selected clusters "good"
-  m  →  label selected clusters "mua"
-  n  →  label selected clusters "noise"
-  u  →  label selected clusters "unsorted"
-  j  →  move selection down one cluster
-  k  →  move selection up one cluster
+Keyboard shortcuts:
+  g            →  merge selected clusters
+  Alt+g/m/n/u  →  label selected clusters good/mua/noise/unsorted
+  Ctrl+g/m/n/u →  label similar clusters good/mua/noise/unsorted
+  Ctrl+Alt+g/m/n/u → label ALL clusters good/mua/noise/unsorted
+  Space        →  select next cluster
+  Shift+Space  →  select previous cluster
+  Up/Down      →  move selection up/down
+  Home/End     →  first/last cluster
+  Ctrl+Z       →  undo last merge
+  Ctrl+Y / Ctrl+Shift+Z → redo
+  Ctrl+S       →  save to disk
+  Ctrl+Q       →  quit
+  Ctrl+Up/Down →  increase/decrease waveform amplitude
 """
 
 from __future__ import annotations
@@ -35,11 +42,11 @@ import numpy as np
 from PyQt6.QtCore import (
     Qt, QObject,
     QAbstractTableModel, QModelIndex, QItemSelectionModel,
-    pyqtSignal, pyqtSlot,
+    pyqtSignal, pyqtSlot, QTimer,
 )
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QFont
 from PyQt6.QtWidgets import (
-    QMainWindow, QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
+    QMainWindow, QDockWidget, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QTableView, QHeaderView, QStatusBar, QLabel, QPushButton,
     QAbstractItemView, QSizePolicy,
 )
@@ -48,7 +55,6 @@ from phy_remote.client.transport import PhyTransport, TransportError
 from phy_remote.client.views.waveform_view import WaveformWidget
 from phy_remote.client.views.isi_view import ISIWidget
 from phy_remote.client.views.amplitude_view import AmplitudeWidget
-from phy_remote.client.views.trace_view import TraceWidget
 from phy_remote.client.views.similarity_view import SimilarityWidget
 from phy_remote.client.views.template_features_view import TemplateFeaturesWidget
 from phy_remote.client.views.feature_cloud_view import FeatureViewWidget
@@ -56,6 +62,7 @@ from phy_remote.client.views.probe_view import ProbeWidget
 from phy_remote.client.views.raster_view import RasterWidget
 from phy_remote.client.views.correlogram_view import CorrelogramWidget
 from phy_remote.client.views.console_view import ConsoleWidget
+from phy_remote.client.views.trace_view import TraceWidget
 
 logger = logging.getLogger(__name__)
 _WAVEFORM_SPIKE_CAP = 100
@@ -170,6 +177,7 @@ class _ClusterTableDock(QDockWidget):
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
+        self._primary_cluster_id: int | None = None
 
         self._model = ClusterTableModel()
         self._view = QTableView()
@@ -208,6 +216,29 @@ class _ClusterTableDock(QDockWidget):
         rows = {idx.row() for idx in self._view.selectionModel().selectedRows()}
         return [self._model.cluster_id_at_row(r) for r in sorted(rows)]
 
+    def all_cluster_ids(self) -> list[int]:
+        return [self._model.cluster_id_at_row(r) for r in range(self._model.rowCount())]
+
+    def select_cluster_by_id(self, cluster_id: int) -> None:
+        """Select the row whose cluster id matches *cluster_id*, if present."""
+        for row in range(self._model.rowCount()):
+            if self._model.cluster_id_at_row(row) == cluster_id:
+                self._jump_to_row(row)
+                return
+
+    def add_cluster_to_selection(self, cluster_id: int) -> None:
+        """Add cluster_id to the current selection without clearing existing rows."""
+        for row in range(self._model.rowCount()):
+            if self._model.cluster_id_at_row(row) == cluster_id:
+                idx = self._model.index(row, 0)
+                self._view.selectionModel().select(
+                    idx,
+                    QItemSelectionModel.SelectionFlag.Select |
+                    QItemSelectionModel.SelectionFlag.Rows,
+                )
+                self._view.scrollTo(idx)
+                return
+
     def adjacent_cluster_ids(self, cluster_ids: list[int], n: int = 3) -> list[int]:
         """Return up to n cluster ids before and n after the current selection."""
         rows = sorted({idx.row() for idx in self._view.selectionModel().selectedRows()})
@@ -229,7 +260,21 @@ class _ClusterTableDock(QDockWidget):
             new_row = 0 if delta > 0 else self._model.rowCount() - 1
         else:
             new_row = max(0, min(self._model.rowCount() - 1, current.row() + delta))
-        new_index = self._model.index(new_row, 0)
+        self._jump_to_row(new_row)
+
+    def jump_to_row(self, row: int) -> None:
+        """Jump to absolute row; row=-1 means last row."""
+        n = self._model.rowCount()
+        if n == 0:
+            return
+        if row < 0:
+            row = n + row
+        row = max(0, min(n - 1, row))
+        self._jump_to_row(row)
+
+    def _jump_to_row(self, row: int) -> None:
+        new_index = self._model.index(row, 0)
+        self._primary_cluster_id = self._model.cluster_id_at_row(row)
         self._view.selectionModel().setCurrentIndex(
             new_index,
             QItemSelectionModel.SelectionFlag.ClearAndSelect |
@@ -239,8 +284,16 @@ class _ClusterTableDock(QDockWidget):
 
     def _on_selection_changed(self, *_) -> None:
         ids = self.selected_cluster_ids()
-        if ids:
-            self.clusters_selected.emit(ids)
+        if not ids:
+            return
+        # A single-row selection always means the user clicked one cluster directly
+        # (mouse click or keyboard nav) — that cluster becomes the new primary.
+        if len(ids) == 1:
+            self._primary_cluster_id = ids[0]
+        elif self._primary_cluster_id in ids and ids[0] != self._primary_cluster_id:
+            ids.remove(self._primary_cluster_id)
+            ids.insert(0, self._primary_cluster_id)
+        self.clusters_selected.emit(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +348,10 @@ class _FetchWorker(QObject):
         skip_templates: bool = False,
     ):
         super().__init__()
-        self.transport = transport
+        # Store connection params — create a private transport in run() so this
+        # worker's ZMQ socket never races with the main-thread transport.
+        self._host = transport.host
+        self._port = transport.port
         self.cluster_ids = cluster_ids
         self.n_spikes = n_spikes
         self.skip_templates = skip_templates
@@ -305,15 +361,23 @@ class _FetchWorker(QObject):
         self._cancelled = True
 
     def run(self):
+        transport = PhyTransport(host=self._host, port=self._port)
+        try:
+            self._run(transport)
+        finally:
+            transport.close()
+
+    def _run(self, transport: PhyTransport):
         if not self.skip_templates:
             templates = {}
             for cid in self.cluster_ids:
                 if self._cancelled:
                     return
                 try:
-                    hdr, tmpl = self.transport.get_templates(cid)
-                    ch_ids = hdr.get("channel_ids", list(range(tmpl.shape[-1])))
-                    templates[cid] = (tmpl, ch_ids)
+                    hdr, tmpl = transport.get_templates(cid)
+                    ch_ids  = hdr.get("channel_ids", list(range(tmpl.shape[-1])))
+                    best_ch = hdr.get("best_ch", ch_ids[0] if ch_ids else None)
+                    templates[cid] = (tmpl, ch_ids, best_ch)
                 except Exception as exc:
                     self.error.emit(f"Template fetch failed for cluster {cid}: {exc}")
                     return
@@ -326,7 +390,7 @@ class _FetchWorker(QObject):
             if self._cancelled:
                 return
             try:
-                _, f = self.transport.get_features(cid)
+                _, f = transport.get_features(cid)
                 features[cid] = f
             except Exception as exc:
                 logger.debug("Feature fetch skipped for cluster %d: %s", cid, exc)
@@ -339,10 +403,12 @@ class _FetchWorker(QObject):
             if self._cancelled:
                 return
             try:
-                _, tf = self.transport.get_template_features(cid)
-                template_features[cid] = tf
+                result = transport.get_template_features(cid)
+                if result is not None:
+                    _, tf = result
+                    template_features[cid] = tf
             except Exception as exc:
-                logger.debug("Template features unavailable for cluster %d: %s", cid, exc)
+                logger.debug("Template features fetch failed for cluster %d: %s", cid, exc)
         if not self._cancelled and template_features:
             self.template_features_ready.emit(template_features)
 
@@ -352,7 +418,7 @@ class _FetchWorker(QObject):
             if self._cancelled:
                 return
             try:
-                spike_data[cid] = self.transport.get_spike_data(cid)
+                spike_data[cid] = transport.get_spike_data(cid)
             except Exception as exc:
                 self.error.emit(f"Spike data fetch failed for cluster {cid}: {exc}")
                 return
@@ -365,7 +431,7 @@ class _FetchWorker(QObject):
             if self._cancelled:
                 return
             try:
-                hdr, w = self.transport.get_waveforms(cid, self.n_spikes)
+                hdr, w = transport.get_waveforms(cid, self.n_spikes)
                 ch_ids = hdr.get("channel_ids", list(range(w.shape[-1])))
                 waveforms[cid] = (w, ch_ids)
             except Exception as exc:
@@ -416,6 +482,7 @@ class _PrefetchWorker(QObject):
             self.finished.emit()
 
 
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -427,6 +494,7 @@ class MainWindow(QMainWindow):
     transport : PhyTransport
     n_spikes  : int   max spikes to fetch per cluster for display
     """
+    _best_channels_loaded = pyqtSignal(dict)   # {cluster_id: best_ch}
 
     def __init__(self, transport: PhyTransport, n_spikes: int = 100):
         super().__init__()
@@ -434,17 +502,25 @@ class MainWindow(QMainWindow):
         self.n_spikes = max(1, min(int(n_spikes), _WAVEFORM_SPIKE_CAP))
         self._fetch_worker:    _FetchWorker    | None = None
         self._prefetch_worker: _PrefetchWorker | None = None
+        self._pending_cluster_ids: list[int] = []
+        self._selection_debounce = QTimer(self)
+        self._selection_debounce.setSingleShot(True)
+        self._selection_debounce.setInterval(80)
+        self._selection_debounce.timeout.connect(self._apply_cluster_selection)
 
         # Caches: templates are cheap (fast to fetch, ~KB each),
         # waveforms are expensive (slow to fetch, ~MB each).
         self._template_cache = _LRUCache(maxsize=30)
         self._waveform_cache = _LRUCache(maxsize=10)
         self._current_cluster_ids: list[int] = []
-        # home channel for each cluster (populated from template headers)
+        # home channel for each cluster (populated from template headers + bulk load at startup)
         self._home_channels: dict[int, int] = {}
         self._template_channels: dict[int, list[int]] = {}
+        # best channel for ALL clusters — loaded once at startup for trace-view tick overlay
+        self._all_best_channels: dict[int, int] = {}
         # spike times for each cluster (populated from spike_data)
         self._spike_times: dict[int, np.ndarray] = {}
+        self._spike_data: dict[int, np.ndarray] = {}   # full (n_spikes, 2) for ISI/amp
         self._features: dict[int, np.ndarray] = {}
         self._template_features: dict[int, np.ndarray] = {}
 
@@ -452,62 +528,62 @@ class MainWindow(QMainWindow):
         self.resize(1700, 950)
         self.setDockNestingEnabled(True)
 
-        # Keep central as spacer; place waveform as an explicit dock.
-        self.setCentralWidget(QWidget(self))
-        self._waveform_dock = QDockWidget("Waveform", self)
-        self._waveform_view = WaveformWidget(max_spikes=self.n_spikes, parent=self)
-        self._waveform_dock.setWidget(self._waveform_view)
-        self._waveform_dock.setMinimumWidth(420)
-        self._waveform_dock.setMinimumHeight(240)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._waveform_dock)
+        # Central widget: two waveform panels side-by-side (top) + amplitude (bottom)
+        self._waveform_view_0 = WaveformWidget(max_spikes=self.n_spikes, cluster_slot=0, parent=self)
+        self._waveform_view_1 = WaveformWidget(max_spikes=self.n_spikes, cluster_slot=1, parent=self)
+        self._waveform_view_0.render_debug.connect(self._console_view_log)
+        self._waveform_view_1.render_debug.connect(self._console_view_log)
+        _wf_splitter = QSplitter(Qt.Orientation.Horizontal)
+        _wf_splitter.addWidget(self._waveform_view_0)
+        _wf_splitter.addWidget(self._waveform_view_1)
+        self._amp_view = AmplitudeWidget(self)
+        _central = QSplitter(Qt.Orientation.Vertical)
+        _central.addWidget(_wf_splitter)
+        _central.addWidget(self._amp_view)
+        _central.setSizes([600, 280])
+        self.setCentralWidget(_central)
 
         # Left dock — cluster table
         self._cluster_dock = _ClusterTableDock(self)
         self._cluster_dock.clusters_selected.connect(self._on_clusters_selected)
+        self._best_channels_loaded.connect(self._on_best_channels_loaded)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._cluster_dock)
-        self._cluster_dock.setMinimumWidth(260)
-
-        # Bottom docks — ISI and Amplitude
-        self._isi_dock = QDockWidget("ISI", self)
-        self._isi_view = ISIWidget(self)
-        self._isi_dock.setWidget(self._isi_view)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._isi_dock)
-
-        self._amp_dock = QDockWidget("Amplitude", self)
-        self._amp_view = AmplitudeWidget(self)
-        self._amp_dock.setWidget(self._amp_view)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._amp_dock)
-
-        # Right dock — trace view
-        self._trace_dock = QDockWidget("Traces", self)
-        self._trace_view = TraceWidget(
-            host=transport.host,
-            port=transport.port,
-            parent=self,
-        )
-        self._trace_dock.setWidget(self._trace_view)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._trace_dock)
+        self._cluster_dock.setMinimumWidth(320)
 
         self._similarity_dock = QDockWidget("Similarity", self)
         self._similarity_view = SimilarityWidget(self)
+        self._similarity_view.cluster_add_requested.connect(
+            self._set_comparison_cluster
+        )
         self._similarity_dock.setWidget(self._similarity_view)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._similarity_dock)
 
-        # Additional phy-style panes (placeholder widgets until implemented)
-        self._template_feat_dock = QDockWidget("Template features", self)
-        self._template_feat_view = TemplateFeaturesWidget(self)
-        self._template_feat_dock.setWidget(self._template_feat_view)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._template_feat_dock)
-
+        # Right dock — feature cloud (large, always visible) + template features below
         self._feature_cloud_dock = QDockWidget("Feature view", self)
         self._feature_cloud_view = FeatureViewWidget(self)
         self._feature_cloud_dock.setWidget(self._feature_cloud_view)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._feature_cloud_dock)
 
-        self._probe_dock = QDockWidget("Probe", self)
-        self._probe_view = ProbeWidget(self)
-        self._probe_dock.setWidget(self._probe_view)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._probe_dock)
+        self._template_feat_dock = QDockWidget("Template features", self)
+        self._template_feat_view = TemplateFeaturesWidget(self)
+        self._template_feat_dock.setWidget(self._template_feat_view)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._template_feat_dock)
+
+        # Trace dock — spans full bottom row on its own row above the others
+        self._trace_dock = QDockWidget("Traces", self)
+        self._trace_view = TraceWidget(
+            host=self.transport.host,
+            port=self.transport.port,
+            parent=self,
+        )
+        self._trace_dock.setWidget(self._trace_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._trace_dock)
+
+        # Bottom docks — ISI, Raster, Correlogram, Console
+        self._isi_dock = QDockWidget("ISI", self)
+        self._isi_view = ISIWidget(self)
+        self._isi_dock.setWidget(self._isi_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._isi_dock)
 
         self._raster_dock = QDockWidget("Raster", self)
         self._raster_view = RasterWidget(self)
@@ -519,50 +595,57 @@ class MainWindow(QMainWindow):
         self._correlogram_dock.setWidget(self._correlogram_view)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._correlogram_dock)
 
+        self._probe_dock = QDockWidget("Probe", self)
+        self._probe_view = ProbeWidget(self)
+        self._probe_dock.setWidget(self._probe_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._probe_dock)
+
         self._console_dock = QDockWidget("Console", self)
         self._console_view = ConsoleWidget(self)
         self._console_dock.setWidget(self._console_view)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._console_dock)
 
-        # Build a phy-like layout: left cluster table, middle waveform + top feature,
-        # large right traces, and several small bottom analysis panes.
-        self.splitDockWidget(self._cluster_dock, self._waveform_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(self._waveform_dock, self._trace_dock, Qt.Orientation.Horizontal)
+        # Layout splits
         self.splitDockWidget(self._cluster_dock, self._similarity_dock, Qt.Orientation.Vertical)
-        self.splitDockWidget(self._waveform_dock, self._template_feat_dock, Qt.Orientation.Vertical)
-        self.splitDockWidget(self._template_feat_dock, self._feature_cloud_dock, Qt.Orientation.Vertical)
-
-        self.splitDockWidget(self._cluster_dock, self._isi_dock, Qt.Orientation.Vertical)
-        self.splitDockWidget(self._isi_dock, self._amp_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(self._amp_dock, self._probe_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(self._probe_dock, self._raster_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(self._feature_cloud_dock, self._template_feat_dock, Qt.Orientation.Vertical)
+        # Trace dock on its own row; ISI etc. stacked below it
+        self.splitDockWidget(self._trace_dock, self._isi_dock, Qt.Orientation.Vertical)
+        self.splitDockWidget(self._isi_dock, self._raster_dock, Qt.Orientation.Horizontal)
         self.splitDockWidget(self._raster_dock, self._correlogram_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(self._correlogram_dock, self._console_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(self._correlogram_dock, self._probe_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(self._probe_dock, self._console_dock, Qt.Orientation.Horizontal)
 
-        self.resizeDocks(
-            [self._cluster_dock, self._waveform_dock, self._trace_dock],
-            [260, 760, 640],
-            Qt.Orientation.Horizontal,
-        )
         self.resizeDocks(
             [self._cluster_dock, self._similarity_dock],
             [620, 280],
             Qt.Orientation.Vertical,
         )
         self.resizeDocks(
-            [self._waveform_dock, self._template_feat_dock, self._feature_cloud_dock],
-            [420, 220, 260],
+            [self._feature_cloud_dock, self._template_feat_dock],
+            [580, 240],
             Qt.Orientation.Vertical,
         )
-        self._waveform_dock.show()
-        self._waveform_dock.raise_()
+        # Left dock wider, right column wider than central widget
         self.resizeDocks(
-            [
-                self._isi_dock, self._amp_dock, self._probe_dock,
-                self._raster_dock, self._correlogram_dock, self._console_dock,
-            ],
-            [220, 220, 220, 220, 220, 220],
+            [self._cluster_dock],
+            [520],
             Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [self._feature_cloud_dock],
+            [900],
+            Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [self._isi_dock, self._raster_dock, self._correlogram_dock,
+             self._probe_dock, self._console_dock],
+            [220, 220, 220, 220, 220],
+            Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [self._trace_dock, self._isi_dock],
+            [280, 240],
+            Qt.Orientation.Vertical,
         )
 
         # Status bar + label buttons
@@ -575,27 +658,60 @@ class MainWindow(QMainWindow):
         # Menu
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self._cluster_dock.toggleViewAction())
-        view_menu.addAction(self._isi_dock.toggleViewAction())
-        view_menu.addAction(self._amp_dock.toggleViewAction())
-        view_menu.addAction(self._waveform_dock.toggleViewAction())
-        view_menu.addAction(self._trace_dock.toggleViewAction())
         view_menu.addAction(self._similarity_dock.toggleViewAction())
-        view_menu.addAction(self._template_feat_dock.toggleViewAction())
         view_menu.addAction(self._feature_cloud_dock.toggleViewAction())
-        view_menu.addAction(self._probe_dock.toggleViewAction())
+        view_menu.addAction(self._template_feat_dock.toggleViewAction())
+        view_menu.addAction(self._trace_dock.toggleViewAction())
+        view_menu.addAction(self._isi_dock.toggleViewAction())
         view_menu.addAction(self._raster_dock.toggleViewAction())
         view_menu.addAction(self._correlogram_dock.toggleViewAction())
+        view_menu.addAction(self._probe_dock.toggleViewAction())
         view_menu.addAction(self._console_dock.toggleViewAction())
 
-        # Keyboard shortcuts — labelling
-        self._add_label_shortcut("g", "good")
-        self._add_label_shortcut("m", "mua")
-        self._add_label_shortcut("n", "noise")
-        self._add_label_shortcut("u", "unsorted")
+        # ------------------------------------------------------------------
+        # Keyboard shortcuts
+        # ------------------------------------------------------------------
 
-        # Keyboard shortcuts — navigation (j = down, k = up, vim-style)
-        self._add_nav_shortcut("j", +1)
-        self._add_nav_shortcut("k", -1)
+        # g = smart: label good (1 cluster selected) OR merge (2+ selected)
+        self._add_shortcut("g", self._smart_g)
+
+        # Label selected: bare letters (m/n/u) — same feel as original phy-remote
+        self._add_shortcut("m", lambda: self._apply_label("mua"))
+        self._add_shortcut("n", lambda: self._apply_label("noise"))
+        self._add_shortcut("u", lambda: self._apply_label("unsorted"))
+
+        # Label similar clusters: Ctrl+letter
+        self._add_shortcut("Ctrl+G", lambda: self._label_similar("good"))
+        self._add_shortcut("Ctrl+M", lambda: self._label_similar("mua"))
+        self._add_shortcut("Ctrl+N", lambda: self._label_similar("noise"))
+        self._add_shortcut("Ctrl+U", lambda: self._label_similar("unsorted"))
+
+        # Label all clusters: Ctrl+Alt+letter
+        self._add_shortcut("Ctrl+Alt+G", lambda: self._label_all("good"))
+        self._add_shortcut("Ctrl+Alt+M", lambda: self._label_all("mua"))
+        self._add_shortcut("Ctrl+Alt+N", lambda: self._label_all("noise"))
+        self._add_shortcut("Ctrl+Alt+U", lambda: self._label_all("unsorted"))
+
+        # Navigation
+        self._add_shortcut("Space",       lambda: self._navigate_cluster(+1))
+        self._add_shortcut("Shift+Space", lambda: self._navigate_cluster(-1))
+        self._add_shortcut("Down",        lambda: self._navigate_cluster(+1))
+        self._add_shortcut("Up",          lambda: self._navigate_cluster(-1))
+        self._add_shortcut("Home",        lambda: self._navigate_cluster_abs(0))
+        self._add_shortcut("End",         lambda: self._navigate_cluster_abs(-1))
+
+        # Undo / Redo
+        self._add_shortcut("Ctrl+Z",       self._undo)
+        self._add_shortcut("Ctrl+Shift+Z", self._redo)
+        self._add_shortcut("Ctrl+Y",       self._redo)
+
+        # Save / Quit
+        self._add_shortcut("Ctrl+S", self._save)
+        self._add_shortcut("Ctrl+Q", self.close)
+
+        # Waveform amplitude zoom (Ctrl+Up/Down; scroll zoom handled in WaveformWidget)
+        self._add_shortcut("Ctrl+Up",   lambda: self._waveform_amp_zoom(1.2))
+        self._add_shortcut("Ctrl+Down", lambda: self._waveform_amp_zoom(1.0 / 1.2))
 
         # Load channel positions then cluster table
         self._load_channel_positions()
@@ -622,19 +738,33 @@ class MainWindow(QMainWindow):
             )
             btn.clicked.connect(lambda checked, lbl=shortcut: self._apply_label(lbl))
             layout.addWidget(btn)
+
+        # Separator + Save button
+        sep = QWidget()
+        sep.setFixedWidth(8)
+        layout.addWidget(sep)
+        save_btn = QPushButton("Save [Ctrl+S]")
+        save_btn.setFixedHeight(22)
+        save_btn.setStyleSheet(
+            "QPushButton { background: #444; color: white; border: none; "
+            "border-radius: 3px; padding: 0 8px; }"
+            "QPushButton:hover { background: #666; }"
+        )
+        save_btn.clicked.connect(self._save)
+        layout.addWidget(save_btn)
         return w
 
-    def _add_label_shortcut(self, key: str, label: str) -> None:
+    def _add_shortcut(self, key: str, slot) -> None:
         sc = QShortcut(QKeySequence(key), self)
-        sc.activated.connect(lambda lbl=label: self._apply_label(lbl))
-
-    def _add_nav_shortcut(self, key: str, delta: int) -> None:
-        sc = QShortcut(QKeySequence(key), self)
-        sc.activated.connect(lambda d=delta: self._navigate_cluster(d))
+        sc.activated.connect(slot)
 
     def _navigate_cluster(self, delta: int) -> None:
         """Move the cluster table selection by delta rows."""
         self._cluster_dock.move_selection(delta)
+
+    def _navigate_cluster_abs(self, row: int) -> None:
+        """Jump to an absolute row (0 = first, -1 = last)."""
+        self._cluster_dock.jump_to_row(row)
 
     @staticmethod
     def _fmt_ids(ids: list[int]) -> str:
@@ -650,12 +780,29 @@ class MainWindow(QMainWindow):
     def _load_channel_positions(self) -> None:
         try:
             positions = self.transport.get_channel_positions()
-            self._waveform_view.set_channel_positions(positions)
-            self._trace_view.set_channel_positions(positions)
+            self._waveform_view_0.set_channel_positions(positions)
+            self._waveform_view_1.set_channel_positions(positions)
             self._probe_view.set_channel_positions(positions)
+            self._trace_view.set_channel_positions(positions)
             logger.info("Loaded %d channel positions", len(positions))
         except Exception as exc:
             logger.warning("Could not load channel positions: %s", exc)
+        # Load best channel for every cluster in background (for trace-view spike overlay)
+        threading.Thread(target=self._load_all_best_channels, daemon=True).start()
+
+    def _load_all_best_channels(self) -> None:
+        try:
+            best = self.transport.get_cluster_best_channels()
+            self._all_best_channels.update(best)
+            self._home_channels.update(best)   # fill gaps before per-cluster template fetches
+            logger.info("Loaded best channels for %d clusters", len(best))
+            self._best_channels_loaded.emit(best)
+        except Exception as exc:
+            logger.warning("Could not load cluster best channels: %s", exc)
+
+    @pyqtSlot(dict)
+    def _on_best_channels_loaded(self, best: dict) -> None:
+        self._trace_view.set_all_best_channels(best)
 
     def _load_cluster_info(self) -> None:
         self._set_status("Loading clusters…")
@@ -677,8 +824,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_clusters_selected(self, cluster_ids: list[int]) -> None:
+        # Debounce rapid table navigation to avoid heavy redraw/refetch on every row step.
+        self._pending_cluster_ids = list(cluster_ids)
+        self._selection_debounce.start()
+
+    def _apply_cluster_selection(self) -> None:
+        cluster_ids = self._pending_cluster_ids
         self._current_cluster_ids = cluster_ids
-        primary_cluster_id = cluster_ids[-1] if cluster_ids else None
+        primary_cluster_id = cluster_ids[0] if cluster_ids else None
         # Reset feature-based panes; they will repopulate from model-backed RPCs.
         self._feature_cloud_view.set_feature_data({})
         self._template_feat_view.set_feature_data({})
@@ -708,10 +861,8 @@ class MainWindow(QMainWindow):
 
         if len(cached_templates) == len(cluster_ids):
             # All templates in cache → show immediately
-            if not self._waveform_dock.isVisible():
-                self._waveform_dock.show()
-            self._waveform_dock.raise_()
-            self._waveform_view.set_waveforms(cached_templates)
+            self._update_probe_view()
+            self._dispatch_waveforms(cached_templates)
 
             # Check if real waveforms are also cached
             cached_waveforms = {
@@ -721,10 +872,13 @@ class MainWindow(QMainWindow):
             }
             if len(cached_waveforms) == len(cluster_ids):
                 self._set_status(f"Cluster(s) {self._fmt_ids(cluster_ids)}  (cached)")
+                self._update_secondary_views_from_cache()
                 self._start_prefetch(cluster_ids)
                 return
 
             # Show templates now; fetch only real waveforms in background
+            # But if spike data is already cached, update secondary views immediately
+            self._update_secondary_views_from_cache()
             self._set_status(
                 f"Cluster(s) {self._fmt_ids(cluster_ids)}  — loading waveforms…"
             )
@@ -732,6 +886,8 @@ class MainWindow(QMainWindow):
             return
 
         # Not cached → full two-stage fetch
+        self._update_probe_view()
+        self._update_secondary_views_from_cache()
         self._set_status(f"Fetching: {self._fmt_ids(cluster_ids)}…")
         self._start_fetch(cluster_ids, skip_templates=False)
 
@@ -770,20 +926,26 @@ class MainWindow(QMainWindow):
     def _on_templates_ready(self, templates: dict) -> None:
         # templates: {cid: (array, ch_ids)}
         logger.info("Templates ready for clusters %s", list(templates.keys()))
-        for cid, (arr, ch_ids) in templates.items():
+        debug_parts = []
+        for cid, (arr, ch_ids, best_ch) in templates.items():
+            shape = tuple(np.asarray(arr).shape)
+            debug_parts.append(f"{cid}:shape={shape},ch={len(ch_ids)},best={best_ch}")
+        if debug_parts:
+            msg = "Templates debug: " + " | ".join(debug_parts)
+            logger.info(msg)
+            self._console_view.log(msg)
+        for cid, (arr, ch_ids, best_ch) in templates.items():
             self._template_cache.put(cid, (arr, ch_ids))
-            # ch_ids[0] is the best (home) channel
+            # best_ch = highest-amplitude channel (not just ch_ids[0] which is sorted by index)
             if ch_ids:
-                self._home_channels[cid] = int(ch_ids[0])
+                self._home_channels[cid] = int(best_ch) if best_ch is not None else int(ch_ids[0])
                 self._template_channels[cid] = [int(c) for c in ch_ids]
+        self._update_probe_view()
         if set(templates.keys()) == set(self._current_cluster_ids):
             self._set_status(
                 f"Cluster(s) {self._fmt_ids(list(templates.keys()))}  — loading waveforms…"
             )
-            if not self._waveform_dock.isVisible():
-                self._waveform_dock.show()
-            self._waveform_dock.raise_()
-            self._waveform_view.set_waveforms(templates)
+            self._dispatch_waveforms(templates)
         else:
             logger.info("Templates discarded (selection changed to %s)", self._current_cluster_ids)
 
@@ -792,7 +954,9 @@ class MainWindow(QMainWindow):
         for cid, arr in features.items():
             self._features[cid] = arr
         if set(features.keys()) == set(self._current_cluster_ids):
-            self._feature_cloud_view.set_feature_data(features)
+            self._feature_cloud_view.set_feature_data(
+                features, spike_times=self._spike_times_for_current()
+            )
 
     @pyqtSlot(dict)
     def _on_template_features_ready(self, template_features: dict) -> None:
@@ -803,69 +967,53 @@ class MainWindow(QMainWindow):
 
     # Tick colours (index 0 = primary/selected cluster)
     _TICK_COLORS = [
-        (0.92, 0.15, 0.15, 1.0),
-        (0.15, 0.47, 0.90, 1.0),
-        (0.10, 0.72, 0.42, 1.0),
-        (0.92, 0.58, 0.08, 1.0),
-        (0.65, 0.15, 0.90, 1.0),
+        (0.20, 0.55, 0.95, 1.0),   # 0 primary — blue
+        (0.92, 0.20, 0.20, 1.0),   # 1 compare — red
+        (0.15, 0.72, 0.35, 1.0),   # 2          — green
+        (0.92, 0.58, 0.08, 1.0),   # 3          — orange
+        (0.65, 0.15, 0.90, 1.0),   # 4          — purple
     ]
 
     @pyqtSlot(dict)
     def _on_spike_data_ready(self, spike_data: dict) -> None:
         logger.info("Spike data ready for clusters %s", list(spike_data.keys()))
-        # Cache spike times
+        # Cache spike times and full spike data
         for cid, data in spike_data.items():
             self._spike_times[cid] = data[:, 0].astype(np.float64)
+            self._spike_data[cid] = data
 
         if set(spike_data.keys()) == set(self._current_cluster_ids):
+            self._update_trace_view()
             self._isi_view.set_spike_data(spike_data)
             self._amp_view.set_spike_data(spike_data)
             self._raster_view.set_spike_times(self._spike_times_for_current())
             self._correlogram_view.set_spike_times(self._spike_times_for_current())
-            self._update_trace_clusters(list(spike_data.keys()))
+            cur_features = self._features_for_current()
+            if cur_features:
+                self._feature_cloud_view.set_feature_data(
+                    cur_features, spike_times=self._spike_times_for_current()
+                )
 
     @pyqtSlot(dict)
     def _on_waveforms_ready(self, waveforms: dict) -> None:
         # waveforms: {cid: (array, ch_ids)}
         logger.info("Waveforms ready for clusters %s", list(waveforms.keys()))
+        debug_parts = []
+        for cid, (arr, ch_ids) in waveforms.items():
+            shape = tuple(np.asarray(arr).shape)
+            debug_parts.append(f"{cid}:shape={shape},ch={len(ch_ids)}")
+        if debug_parts:
+            msg = "Waveforms debug: " + " | ".join(debug_parts)
+            logger.info(msg)
+            self._console_view.log(msg)
         for cid, val in waveforms.items():
             self._waveform_cache.put(cid, val)
         if set(waveforms.keys()) == set(self._current_cluster_ids):
             self._set_status(f"Cluster(s) {self._fmt_ids(list(waveforms.keys()))}")
-            self._waveform_view.set_waveforms(waveforms)
-            # Update trace overlays now that we have home channels confirmed
-            self._update_trace_clusters(list(waveforms.keys()))
+            self._dispatch_waveforms(waveforms)
             self._start_prefetch(self._current_cluster_ids)
         else:
             logger.info("Waveforms discarded (selection changed to %s)", self._current_cluster_ids)
-
-    def _update_trace_clusters(self, cluster_ids: list[int]) -> None:
-        """Build cluster_data dict and push it to the trace view."""
-        cluster_data = {}
-        for idx, cid in enumerate(cluster_ids):
-            times   = self._spike_times.get(cid)
-            home_ch = self._home_channels.get(cid)
-            if times is None or home_ch is None:
-                continue
-            color = self._TICK_COLORS[idx % len(self._TICK_COLORS)]
-            cluster_data[cid] = (times, home_ch, color)
-
-        if not cluster_data:
-            return
-
-        self._trace_view.set_cluster_data(cluster_data)
-        selected_channels = []
-        for cid, (_times, home_ch, color) in cluster_data.items():
-            channels = self._template_channels.get(cid, [home_ch])[:8]
-            selected_channels.append((channels, color))
-        self._probe_view.set_selected_channels(selected_channels)
-
-        # Center traces on first selected spike when available.
-        first_times = cluster_data[cluster_ids[0]][0]
-        if len(first_times):
-            self._trace_view.go_to_time(float(first_times[0]))
-        else:
-            self._trace_view.go_to_time(0.0)
 
     @pyqtSlot(str)
     def _on_fetch_error(self, msg: str) -> None:
@@ -894,8 +1042,155 @@ class MainWindow(QMainWindow):
         for cid in cluster_ids:
             self._cluster_dock.update_label(cid, label)
         clu_str = ", ".join(str(c) for c in cluster_ids)
-        self._set_status(f"Labelled {clu_str} → {label}")
+        self._set_status(f"Labelled {clu_str} → {label}  [unsaved — Ctrl+S to save]")
+        self._mark_unsaved()
         logger.info("Labelled cluster(s) %s as %r", cluster_ids, label)
+
+    # ------------------------------------------------------------------
+    # Merge / undo / redo / save
+    # ------------------------------------------------------------------
+
+    def _smart_g(self) -> None:
+        """g: label good when 1 cluster selected; merge when 2+ selected."""
+        ids = self._cluster_dock.selected_cluster_ids()
+        if len(ids) >= 2:
+            self._merge_clusters()
+        else:
+            self._apply_label("good")
+
+    def _merge_clusters(self) -> None:
+        cluster_ids = self._cluster_dock.selected_cluster_ids()
+        if len(cluster_ids) < 2:
+            self._set_status("Select at least 2 clusters to merge")
+            return
+        # Evict merged clusters from caches so stale data isn't shown
+        for cid in cluster_ids:
+            self._template_cache._data.pop(cid, None)
+            self._waveform_cache._data.pop(cid, None)
+        try:
+            result = self.transport.merge_clusters(cluster_ids)
+        except TransportError as exc:
+            self._set_status(f"Merge error: {exc}")
+            return
+        new_id = result.get("new_cluster_id")
+        self._console_view.log(f"Merged {self._fmt_ids(cluster_ids)} → {new_id}")
+        self._set_status(f"Merged {self._fmt_ids(cluster_ids)} → cluster {new_id}  [unsaved — Ctrl+S to save]")
+        self._mark_unsaved()
+        clusters = result.get("clusters")
+        if clusters:
+            self._reload_from_cluster_list(clusters)
+        else:
+            self._load_cluster_info()
+        # Select the newly created cluster so its waveforms load automatically
+        if new_id is not None:
+            self._cluster_dock.select_cluster_by_id(new_id)
+
+    def _undo(self) -> None:
+        try:
+            result = self.transport.undo()
+        except TransportError as exc:
+            self._set_status(f"Undo: {exc}")
+            return
+        self._set_status("Undo")
+        clusters = result.get("clusters")
+        if clusters:
+            self._reload_from_cluster_list(clusters)
+        else:
+            self._load_cluster_info()
+
+    def _redo(self) -> None:
+        try:
+            result = self.transport.redo()
+        except TransportError as exc:
+            self._set_status(f"Redo: {exc}")
+            return
+        self._set_status("Redo")
+        clusters = result.get("clusters")
+        if clusters:
+            self._reload_from_cluster_list(clusters)
+        else:
+            self._load_cluster_info()
+
+    def _mark_unsaved(self) -> None:
+        title = self.windowTitle()
+        if not title.endswith(" *"):
+            self.setWindowTitle(title + " *")
+
+    def _mark_saved(self) -> None:
+        title = self.windowTitle()
+        if title.endswith(" *"):
+            self.setWindowTitle(title[:-2])
+
+    def _save(self) -> None:
+        try:
+            self.transport.save()
+            self._mark_saved()
+            self._set_status("Saved")
+            self._console_view.log("Saved spike_clusters.npy + cluster_group.tsv")
+        except TransportError as exc:
+            self._set_status(f"Save error: {exc}")
+
+    def _reload_from_cluster_list(self, clusters: list[dict]) -> None:
+        """Update cluster table from a server-supplied cluster list."""
+        self._cluster_dock.populate(clusters)
+        self._similarity_view.set_cluster_info(clusters)
+        n_good = sum(1 for c in clusters if c["label"] == "good")
+        self._set_status(f"{len(clusters)} clusters  —  {n_good} good")
+
+    # ------------------------------------------------------------------
+    # Label similar / label all
+    # ------------------------------------------------------------------
+
+    def _label_similar(self, label: str) -> None:
+        """Label all clusters shown in the similarity view as *label*."""
+        rows = self._similarity_view.current_rows()
+        if not rows:
+            self._set_status("No similar clusters to label")
+            return
+        cluster_ids = [r["id"] for r in rows]
+        try:
+            self.transport.label_cluster(cluster_ids, label)
+        except TransportError as exc:
+            self._set_status(f"Label error: {exc}")
+            return
+        for cid in cluster_ids:
+            self._cluster_dock.update_label(cid, label)
+        self._set_status(f"Labelled {len(cluster_ids)} similar clusters → {label}")
+
+    def _label_all(self, label: str) -> None:
+        """Label every cluster in the table as *label*."""
+        cluster_ids = self._cluster_dock.all_cluster_ids()
+        if not cluster_ids:
+            return
+        try:
+            self.transport.label_cluster(cluster_ids, label)
+        except TransportError as exc:
+            self._set_status(f"Label error: {exc}")
+            return
+        for cid in cluster_ids:
+            self._cluster_dock.update_label(cid, label)
+        self._set_status(f"Labelled all {len(cluster_ids)} clusters → {label}")
+
+    # ------------------------------------------------------------------
+    # Waveform zoom helpers
+    # ------------------------------------------------------------------
+
+    def _dispatch_waveforms(self, data: dict) -> None:
+        """Send cluster 0 to left panel, cluster 1 to right panel."""
+        items = list(data.items())
+        if len(items) >= 1:
+            self._waveform_view_0.set_waveforms({items[0][0]: items[0][1]})
+        else:
+            self._waveform_view_0.clear()
+        if len(items) >= 2:
+            self._waveform_view_1.set_waveforms({items[1][0]: items[1][1]})
+        else:
+            self._waveform_view_1.clear()
+
+    def _waveform_amp_zoom(self, factor: float) -> None:
+        """Scale waveform amplitude up or down on both panels."""
+        for wv in (self._waveform_view_0, self._waveform_view_1):
+            wv._set_y_zoom(wv._y_zoom * factor)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -904,12 +1199,39 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         self._status_label.setText(text)
 
+    @pyqtSlot(str)
+    def _console_view_log(self, text: str) -> None:
+        if hasattr(self, "_console_view"):
+            self._console_view.log(text)
+
     def _spike_times_for_current(self) -> dict[int, np.ndarray]:
         out = {}
         for cid in self._current_cluster_ids:
             if cid in self._spike_times:
                 out[cid] = self._spike_times[cid]
         return out
+
+    def _update_secondary_views_from_cache(self) -> None:
+        """Refresh ISI, amplitude, raster, correlogram, and feature views from cache."""
+        sd = self._spike_data_for_current()
+        if sd:
+            self._isi_view.set_spike_data(sd)
+            self._amp_view.set_spike_data(sd)
+            self._raster_view.set_spike_times(self._spike_times_for_current())
+            self._correlogram_view.set_spike_times(self._spike_times_for_current())
+        cur_features = self._features_for_current()
+        if cur_features:
+            self._feature_cloud_view.set_feature_data(
+                cur_features, spike_times=self._spike_times_for_current()
+            )
+        cur_tf = {cid: self._template_features[cid]
+                  for cid in self._current_cluster_ids if cid in self._template_features}
+        if cur_tf:
+            self._template_feat_view.set_feature_data(cur_tf)
+
+    def _spike_data_for_current(self) -> dict[int, np.ndarray]:
+        return {cid: self._spike_data[cid]
+                for cid in self._current_cluster_ids if cid in self._spike_data}
 
     def _features_for_current(self) -> dict[int, np.ndarray]:
         out = {}
@@ -918,9 +1240,75 @@ class MainWindow(QMainWindow):
                 out[cid] = self._features[cid]
         return out
 
+    def _set_comparison_cluster(self, cluster_id: int) -> None:
+        """Keep the primary cluster selected; replace any comparison with cluster_id."""
+        primary = self._cluster_dock._primary_cluster_id
+        if primary is None:
+            return
+
+        # Stop any queued debounce before touching the selection model
+        self._selection_debounce.stop()
+        self._pending_cluster_ids = [primary, cluster_id]
+
+        # Block selection signals so table updates don't restart the debounce
+        sm = self._cluster_dock._view.selectionModel()
+        sm.blockSignals(True)
+        try:
+            self._cluster_dock.select_cluster_by_id(primary)
+            self._cluster_dock.add_cluster_to_selection(cluster_id)
+        finally:
+            sm.blockSignals(False)
+
+        # Schedule apply for next event-loop iteration (safe from within a slot)
+        QTimer.singleShot(0, self._apply_cluster_selection)
+
+    def _update_probe_view(self) -> None:
+        """Push current selected-channel info to the probe view."""
+        sel = []
+        for idx, cid in enumerate(self._current_cluster_ids):
+            if cid in self._template_channels:
+                color = self._TICK_COLORS[idx % len(self._TICK_COLORS)]
+                sel.append((self._template_channels[cid], color))
+        if sel:
+            self._probe_view.set_selected_channels(sel)
+        self._update_trace_view()
+
+    def _update_trace_view(self) -> None:
+        """Push spike overlay data for the current clusters to the trace view."""
+        cluster_data = {}
+        for idx, cid in enumerate(self._current_cluster_ids):
+            if cid not in self._spike_times:
+                continue
+            home_ch = self._home_channels.get(cid)
+            if home_ch is None:
+                continue
+            color = self._TICK_COLORS[idx % len(self._TICK_COLORS)]
+            cluster_data[cid] = (self._spike_times[cid], home_ch, color)
+        self._trace_view.set_cluster_data(cluster_data)
+        # Jump to first spike of primary cluster on new selection
+        if cluster_data:
+            self._trace_view.go_to_first_spike()
+
     def closeEvent(self, event) -> None:
         if self._fetch_worker is not None:
             self._fetch_worker.cancel()
         if self._prefetch_worker is not None:
             self._prefetch_worker.cancel()
+        # Close all fastplotlib figures before Qt destroys the widgets.
+        # rendercanvas connects an aboutToQuit handler that accesses the
+        # canvas C++ object — if we let Qt destroy widgets first that handler
+        # crashes with "wrapped C/C++ object has been deleted".
+        _fpl_views = (
+            self._waveform_view_0, self._waveform_view_1,
+            self._amp_view, self._isi_view, self._raster_view,
+            self._correlogram_view, self._feature_cloud_view,
+            self._template_feat_view, self._trace_view,
+        )
+        for view in _fpl_views:
+            fig = getattr(view, '_fig', None)
+            if fig is not None:
+                try:
+                    fig.close()
+                except Exception:
+                    pass
         super().closeEvent(event)

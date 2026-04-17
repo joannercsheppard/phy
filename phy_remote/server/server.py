@@ -49,6 +49,57 @@ logger = logging.getLogger(__name__)
 _TOP_WAVEFORM_CHANNELS = 10
 
 
+def _compute_cluster_depths(model, spike_clusters, cluster_ids) -> dict:
+    """Return {cluster_id: depth_um} using channel_positions + dominant template.
+
+    Depth = y-coordinate of the channel with highest template amplitude.
+    Returns empty dict if the model lacks the required attributes.
+    """
+    m = model
+    depths: dict = {}
+    try:
+        if not (hasattr(m, 'sparse_templates') and m.sparse_templates is not None):
+            return depths
+        if not (hasattr(m, 'channel_positions') and m.channel_positions is not None):
+            return depths
+        if not (hasattr(m, 'spike_templates') and m.spike_templates is not None):
+            return depths
+
+        tmpl_data  = np.asarray(m.sparse_templates.data)   # (n_templates, n_samples, n_ch_loc)
+        tmpl_cols  = m.sparse_templates.cols                # (n_templates, n_ch_loc) or None
+        ch_pos     = np.asarray(m.channel_positions)        # (n_ch, 2)
+        spike_tmpls = np.asarray(m.spike_templates, dtype=np.int64)
+
+        # Peak-to-peak per template per local channel → best local channel per template
+        ptp = tmpl_data.max(axis=1) - tmpl_data.min(axis=1)   # (n_templates, n_ch_loc)
+        best_local = ptp.argmax(axis=1)                        # (n_templates,)
+
+        # Map local → global channel ids
+        if tmpl_cols is not None:
+            tmpl_cols_arr = np.asarray(tmpl_cols)
+            best_global = np.array(
+                [int(tmpl_cols_arr[t, best_local[t]]) for t in range(len(best_local))],
+                dtype=np.int64,
+            )
+        else:
+            best_global = best_local.astype(np.int64)
+
+        # Dominant template per cluster → depth
+        for cid in cluster_ids:
+            mask = spike_clusters == cid
+            if not mask.any():
+                continue
+            tmpl_arr = spike_tmpls[mask]
+            best_tmpl = int(np.argmax(np.bincount(tmpl_arr)))
+            if best_tmpl < len(best_global):
+                best_ch = int(best_global[best_tmpl])
+                if best_ch < len(ch_pos):
+                    depths[int(cid)] = float(ch_pos[best_ch][1])
+    except Exception as exc:
+        logger.debug("_compute_cluster_depths failed: %s", exc)
+    return depths
+
+
 class PhyServer:
     """
     Minimal ZMQ REP server wrapping a phy TemplateModel.
@@ -356,6 +407,9 @@ class PhyServer:
         # firing rate: n_spikes / recording duration
         duration = float(m.spike_times[-1]) if len(m.spike_times) else 1.0
 
+        # depth: y-coordinate of each cluster's best channel from channel_positions
+        depths = _compute_cluster_depths(m, spike_clusters, cluster_ids)
+
         clusters = []
         for cid in cluster_ids:
             cid = int(cid)
@@ -366,6 +420,7 @@ class PhyServer:
                 "n_spikes": n,
                 "amplitude": round(amplitudes.get(cid, 0.0), 1),
                 "fr": round(n / duration, 2),
+                "depth": round(depths.get(cid, 0.0), 1),
             })
 
         return encode_response(clusters=clusters)
@@ -442,12 +497,23 @@ class PhyServer:
             except Exception as exc:
                 logger.warning("HP filter failed: %s", exc)
 
-        # Downsample for display if needed
+        # Downsample for display using min-max method so spike peaks are preserved.
+        # Each block of `step` samples is replaced by (min, max) in that block,
+        # giving at most 2*max_samples columns.  The t_arr on the client is rebuilt
+        # from actual t_start/t_end so the doubled-up sample count is transparent.
         n_s = chunk.shape[1]
         if n_s > max_samples:
             step = n_s // max_samples
-            chunk = chunk[:, ::step]
-            actual_t_end = t_start + (chunk.shape[1] * step) / sr
+            n_blocks = n_s // step
+            trimmed = chunk[:, :n_blocks * step].reshape(chunk.shape[0], n_blocks, step)
+            mins = trimmed.min(axis=2)   # (n_ch, n_blocks)
+            maxs = trimmed.max(axis=2)   # (n_ch, n_blocks)
+            # Interleave min and max so the waveform shape is preserved
+            out = np.empty((chunk.shape[0], n_blocks * 2), dtype=np.float32)
+            out[:, 0::2] = mins
+            out[:, 1::2] = maxs
+            chunk = out
+            actual_t_end = t_start + (n_blocks * step) / sr
         else:
             actual_t_end = s_end / sr
 
@@ -497,19 +563,20 @@ class PhyServer:
 
     def _handle_get_cluster_best_channels(self, req: dict) -> list[bytes]:
         """
-        Return the single best (highest-amplitude) channel for every cluster.
+        Return the top channels for every cluster.
 
-        Response header: best_channels = {str(cluster_id): best_ch_int, ...}
+        Response header: best_channels = {str(cluster_id): [ch0, ch1, ...], ...}
         No array frame.
         """
         self._require_model()
-        best_channels: dict[str, int] = {}
+        top_n = int(req.get("top_n", 5))
+        best_channels: dict[str, list[int]] = {}
         for cid in self.model.cluster_ids:
-            _, _, best_ch = self._template_waveform_and_channels_for_cluster(
-                int(cid), top_n=1
+            _, ch_top, _ = self._template_waveform_and_channels_for_cluster(
+                int(cid), top_n=top_n
             )
-            if best_ch is not None:
-                best_channels[str(int(cid))] = int(best_ch)
+            if ch_top:
+                best_channels[str(int(cid))] = ch_top
         return encode_response(best_channels=best_channels)
 
     def _handle_get_channel_positions(self, req: dict) -> list[bytes]:
@@ -893,6 +960,7 @@ class PhyServer:
                 if mask.any():
                     amplitudes[int(cid)] = float(np.mean(m.amplitudes[mask]))
         duration = float(m.spike_times[-1]) if len(m.spike_times) else 1.0
+        depths = _compute_cluster_depths(m, sc, cluster_ids)
         clusters = []
         for cid in cluster_ids:
             cid = int(cid)
@@ -903,6 +971,7 @@ class PhyServer:
                 "n_spikes": n,
                 "amplitude": round(amplitudes.get(cid, 0.0), 1),
                 "fr": round(n / duration, 2),
+                "depth": round(depths.get(cid, 0.0), 1),
             })
         return clusters
 

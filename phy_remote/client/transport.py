@@ -271,11 +271,11 @@ class PhyTransport:
             raise TransportError("server sent no array for get_channel_positions")
         return array
 
-    def get_cluster_best_channels(self) -> "dict[int, int]":
-        """Return {cluster_id: best_channel_index} for every cluster."""
-        header, _ = self._call(CMD_GET_CLUSTER_BEST_CHANNELS)
+    def get_cluster_best_channels(self, top_n: int = 5) -> "dict[int, list[int]]":
+        """Return {cluster_id: [ch0, ch1, ...]} top channels for every cluster."""
+        header, _ = self._call(CMD_GET_CLUSTER_BEST_CHANNELS, top_n=top_n)
         raw = header.get("best_channels", {})
-        return {int(k): int(v) for k, v in raw.items()}
+        return {int(k): [int(c) for c in v] for k, v in raw.items()}
 
     def get_spike_data(self, cluster_id: int) -> np.ndarray:
         """

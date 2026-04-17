@@ -54,7 +54,7 @@ from PyQt6.QtWidgets import (
 from phy_remote.client.transport import PhyTransport, TransportError
 from phy_remote.client.views.waveform_view import WaveformWidget
 from phy_remote.client.views.isi_view import ISIWidget
-from phy_remote.client.views.amplitude_view import AmplitudeWidget
+from phy_remote.client.views.amplitude_view import AmplitudeWidget, TemplateAmplitudeWidget
 from phy_remote.client.views.similarity_view import SimilarityWidget
 from phy_remote.client.views.template_features_view import TemplateFeaturesWidget
 from phy_remote.client.views.feature_cloud_view import FeatureViewWidget
@@ -472,9 +472,11 @@ class _PrefetchWorker(QObject):
                 if self._cancelled:
                     break
                 try:
-                    _, tmpl = transport.get_templates(cid)
+                    hdr, tmpl = transport.get_templates(cid)
                     if not self._cancelled:
-                        self.template_ready.emit(cid, tmpl)
+                        ch_ids  = hdr.get("channel_ids", list(range(tmpl.shape[-1])))
+                        best_ch = hdr.get("best_ch", ch_ids[0] if ch_ids else None)
+                        self.template_ready.emit(cid, (tmpl, ch_ids, best_ch))
                 except Exception as exc:
                     logger.debug("Prefetch skipped cluster %d: %s", cid, exc)
         finally:
@@ -525,10 +527,10 @@ class MainWindow(QMainWindow):
         self._template_features: dict[int, np.ndarray] = {}
 
         self.setWindowTitle("phy-remote")
-        self.resize(1700, 950)
+        self.resize(1800, 1200)
         self.setDockNestingEnabled(True)
 
-        # Central widget: two waveform panels side-by-side (top) + amplitude (bottom)
+        # Central widget: two waveform panels side-by-side
         self._waveform_view_0 = WaveformWidget(max_spikes=self.n_spikes, cluster_slot=0, parent=self)
         self._waveform_view_1 = WaveformWidget(max_spikes=self.n_spikes, cluster_slot=1, parent=self)
         self._waveform_view_0.render_debug.connect(self._console_view_log)
@@ -536,12 +538,7 @@ class MainWindow(QMainWindow):
         _wf_splitter = QSplitter(Qt.Orientation.Horizontal)
         _wf_splitter.addWidget(self._waveform_view_0)
         _wf_splitter.addWidget(self._waveform_view_1)
-        self._amp_view = AmplitudeWidget(self)
-        _central = QSplitter(Qt.Orientation.Vertical)
-        _central.addWidget(_wf_splitter)
-        _central.addWidget(self._amp_view)
-        _central.setSizes([600, 280])
-        self.setCentralWidget(_central)
+        self.setCentralWidget(_wf_splitter)
 
         # Left dock — cluster table
         self._cluster_dock = _ClusterTableDock(self)
@@ -561,6 +558,7 @@ class MainWindow(QMainWindow):
         # Right dock — feature cloud (large, always visible) + template features below
         self._feature_cloud_dock = QDockWidget("Feature view", self)
         self._feature_cloud_view = FeatureViewWidget(self)
+        self._feature_cloud_view.spikes_selected.connect(self._on_feature_spikes_selected)
         self._feature_cloud_dock.setWidget(self._feature_cloud_view)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._feature_cloud_dock)
 
@@ -605,6 +603,16 @@ class MainWindow(QMainWindow):
         self._console_dock.setWidget(self._console_view)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._console_dock)
 
+        self._amp_time_dock = QDockWidget("Amplitude vs time", self)
+        self._amp_view = AmplitudeWidget(self)
+        self._amp_time_dock.setWidget(self._amp_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._amp_time_dock)
+
+        self._amp_template_dock = QDockWidget("Template amplitudes", self)
+        self._template_amp_view = TemplateAmplitudeWidget(self)
+        self._amp_template_dock.setWidget(self._template_amp_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._amp_template_dock)
+
         # Layout splits
         self.splitDockWidget(self._cluster_dock, self._similarity_dock, Qt.Orientation.Vertical)
         self.splitDockWidget(self._feature_cloud_dock, self._template_feat_dock, Qt.Orientation.Vertical)
@@ -614,6 +622,8 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self._raster_dock, self._correlogram_dock, Qt.Orientation.Horizontal)
         self.splitDockWidget(self._correlogram_dock, self._probe_dock, Qt.Orientation.Horizontal)
         self.splitDockWidget(self._probe_dock, self._console_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(self._console_dock, self._amp_time_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(self._amp_time_dock, self._amp_template_dock, Qt.Orientation.Horizontal)
 
         self.resizeDocks(
             [self._cluster_dock, self._similarity_dock],
@@ -638,13 +648,14 @@ class MainWindow(QMainWindow):
         )
         self.resizeDocks(
             [self._isi_dock, self._raster_dock, self._correlogram_dock,
-             self._probe_dock, self._console_dock],
-            [220, 220, 220, 220, 220],
+             self._probe_dock, self._console_dock,
+             self._amp_time_dock, self._amp_template_dock],
+            [220, 220, 220, 220, 220, 280, 280],
             Qt.Orientation.Horizontal,
         )
         self.resizeDocks(
             [self._trace_dock, self._isi_dock],
-            [280, 240],
+            [500, 320],
             Qt.Orientation.Vertical,
         )
 
@@ -667,6 +678,8 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self._correlogram_dock.toggleViewAction())
         view_menu.addAction(self._probe_dock.toggleViewAction())
         view_menu.addAction(self._console_dock.toggleViewAction())
+        view_menu.addAction(self._amp_time_dock.toggleViewAction())
+        view_menu.addAction(self._amp_template_dock.toggleViewAction())
 
         # ------------------------------------------------------------------
         # Keyboard shortcuts
@@ -791,10 +804,18 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._load_all_best_channels, daemon=True).start()
 
     def _load_all_best_channels(self) -> None:
+        from phy_remote.client.transport import PhyTransport
         try:
-            best = self.transport.get_cluster_best_channels()
+            tr = PhyTransport(host=self.transport.host, port=self.transport.port)
+            try:
+                best = tr.get_cluster_best_channels(top_n=5)
+            finally:
+                tr.close()
             self._all_best_channels.update(best)
-            self._home_channels.update(best)   # fill gaps before per-cluster template fetches
+            # _home_channels stores single int (first = best amplitude channel)
+            for cid, chs in best.items():
+                if cid not in self._home_channels and chs:
+                    self._home_channels[cid] = chs[0]
             logger.info("Loaded best channels for %d clusters", len(best))
             self._best_channels_loaded.emit(best)
         except Exception as exc:
@@ -810,6 +831,7 @@ class MainWindow(QMainWindow):
             clusters = self.transport.get_cluster_info()
             self._cluster_dock.populate(clusters)
             self._similarity_view.set_cluster_info(clusters)
+            self._template_amp_view.set_cluster_info(clusters)
             n_good = sum(1 for c in clusters if c["label"] == "good")
             self._set_status(
                 f"{len(clusters)} clusters  —  {n_good} good"
@@ -835,6 +857,7 @@ class MainWindow(QMainWindow):
         # Reset feature-based panes; they will repopulate from model-backed RPCs.
         self._feature_cloud_view.set_feature_data({})
         self._template_feat_view.set_feature_data({})
+        self._template_amp_view.set_selected(cluster_ids)
 
         # Update similarity table from the last selected cluster (Phy behavior).
         if primary_cluster_id is not None:
@@ -860,7 +883,13 @@ class MainWindow(QMainWindow):
         }
 
         if len(cached_templates) == len(cluster_ids):
-            # All templates in cache → show immediately
+            # All templates in cache → ensure template_channels populated before probe view
+            for cid, (arr, ch_ids) in cached_templates.items():
+                self._template_channels.setdefault(cid, list(ch_ids))
+                if ch_ids and cid not in self._home_channels:
+                    self._home_channels[cid] = self._all_best_channels.get(
+                        cid, int(ch_ids[0])
+                    )
             self._update_probe_view()
             self._dispatch_waveforms(cached_templates)
 
@@ -955,7 +984,9 @@ class MainWindow(QMainWindow):
             self._features[cid] = arr
         if set(features.keys()) == set(self._current_cluster_ids):
             self._feature_cloud_view.set_feature_data(
-                features, spike_times=self._spike_times_for_current()
+                features,
+                spike_times=self._spike_times_for_current(),
+                channel_ids=self._template_channels_for_current(),
             )
 
     @pyqtSlot(dict)
@@ -991,7 +1022,9 @@ class MainWindow(QMainWindow):
             cur_features = self._features_for_current()
             if cur_features:
                 self._feature_cloud_view.set_feature_data(
-                    cur_features, spike_times=self._spike_times_for_current()
+                    cur_features,
+                    spike_times=self._spike_times_for_current(),
+                    channel_ids=self._template_channels_for_current(),
                 )
 
     @pyqtSlot(dict)
@@ -1022,7 +1055,14 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int, object)
     def _on_prefetch_template(self, cluster_id: int, template) -> None:
-        self._template_cache.put(cluster_id, template)
+        if isinstance(template, tuple) and len(template) == 3:
+            arr, ch_ids, best_ch = template
+            self._template_cache.put(cluster_id, (arr, ch_ids))
+            self._template_channels.setdefault(cluster_id, list(ch_ids))
+            if best_ch is not None:
+                self._home_channels.setdefault(cluster_id, int(best_ch))
+        else:
+            self._template_cache.put(cluster_id, template)
         logger.debug("Prefetched template for cluster %d", cluster_id)
 
     # ------------------------------------------------------------------
@@ -1134,6 +1174,7 @@ class MainWindow(QMainWindow):
         """Update cluster table from a server-supplied cluster list."""
         self._cluster_dock.populate(clusters)
         self._similarity_view.set_cluster_info(clusters)
+        self._template_amp_view.set_cluster_info(clusters)
         n_good = sum(1 for c in clusters if c["label"] == "good")
         self._set_status(f"{len(clusters)} clusters  —  {n_good} good")
 
@@ -1222,7 +1263,9 @@ class MainWindow(QMainWindow):
         cur_features = self._features_for_current()
         if cur_features:
             self._feature_cloud_view.set_feature_data(
-                cur_features, spike_times=self._spike_times_for_current()
+                cur_features,
+                spike_times=self._spike_times_for_current(),
+                channel_ids=self._template_channels_for_current(),
             )
         cur_tf = {cid: self._template_features[cid]
                   for cid in self._current_cluster_ids if cid in self._template_features}
@@ -1239,6 +1282,23 @@ class MainWindow(QMainWindow):
             if cid in self._features:
                 out[cid] = self._features[cid]
         return out
+
+    def _template_channels_for_current(self) -> dict[int, list[int]]:
+        return {
+            cid: self._template_channels[cid]
+            for cid in self._current_cluster_ids
+            if cid in self._template_channels
+        }
+
+    @pyqtSlot(dict)
+    def _on_feature_spikes_selected(self, selected: dict) -> None:
+        """Handle lasso selection in the feature view — show count in status bar."""
+        total = sum(len(v) for v in selected.values())
+        cids  = list(selected.keys())
+        self._set_status(
+            f"Lasso: {total} spike(s) selected in cluster(s) {cids}. "
+            "Use Merge or manual split to act on selection."
+        )
 
     def _set_comparison_cluster(self, cluster_id: int) -> None:
         """Keep the primary cluster selected; replace any comparison with cluster_id."""
@@ -1282,8 +1342,10 @@ class MainWindow(QMainWindow):
             home_ch = self._home_channels.get(cid)
             if home_ch is None:
                 continue
+            # Pass all template channels so ticks appear on every visible row
+            ch_list = self._template_channels.get(cid, [home_ch])
             color = self._TICK_COLORS[idx % len(self._TICK_COLORS)]
-            cluster_data[cid] = (self._spike_times[cid], home_ch, color)
+            cluster_data[cid] = (self._spike_times[cid], ch_list, color)
         self._trace_view.set_cluster_data(cluster_data)
         # Jump to first spike of primary cluster on new selection
         if cluster_data:

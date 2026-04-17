@@ -17,10 +17,10 @@ import threading
 from typing import Any
 
 import numpy as np
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QPushButton,
-    QSizePolicy, QVBoxLayout, QWidget,
+    QRubberBand, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _WINDOW_S       = 1.0       # default display window in seconds
 _SHIFT_FRAC     = 0.5       # Alt+arrow scrolls this fraction of window
 _TRACE_COLOR    = (0.45, 0.45, 0.45, 0.90)
-_TICK_HALF      = 0.35      # tick mark half-height in channel-spacing units
 _MAX_SAMPLES    = 3_000     # server-side downsampling cap
 
 # Cluster colors index 0=primary, 1=comparison, …
@@ -239,9 +238,11 @@ class TraceWidget(QWidget):
         self._canvas_layout.addWidget(self._canvas_widget)
         self._canvas_widget.hide()
 
-        # Event filter for wheel + key events
+        # Event filters
         self._event_filter = _TraceEventFilter(self, self._canvas_widget, self)
         QApplication.instance().installEventFilter(self._event_filter)
+        self._box_zoom_filter = _BoxZoomFilter(self, self._canvas_widget, self)
+        QApplication.instance().installEventFilter(self._box_zoom_filter)
 
         # Right-click drag via fpl canvas events
         try:
@@ -359,7 +360,15 @@ class TraceWidget(QWidget):
                 f"{t0:.3f}–{t1:.3f} s  ·  {n_ch} ch  ·  "
                 f"{'HP' if self._filtered else 'raw'}"
             )
-            QTimer.singleShot(60, self._fit_camera)
+            pre = getattr(getattr(self, "_box_zoom_filter", None), "_pre_zoom_state", None)
+            if pre:
+                # Re-apply y-zoom now and again after fpl's own render pass
+                self._box_zoom_filter._apply_y_zoom(pre["y_mid"], pre["y_height"])
+                QTimer.singleShot(80, lambda: self._box_zoom_filter._apply_y_zoom(
+                    pre["y_mid"], pre["y_height"]
+                ))
+            else:
+                QTimer.singleShot(60, self._fit_camera)
         except Exception as exc:
             logger.exception("TraceWidget render error: %s", exc)
 
@@ -402,7 +411,7 @@ class TraceWidget(QWidget):
             self._line_collection = sp.add_line_collection(
                 data=lines,
                 colors=_TRACE_COLOR,
-                thickness=1.0,
+                thickness=0.5,
             )
         except AttributeError:
             # Fallback: NaN-separated single line
@@ -415,122 +424,130 @@ class TraceWidget(QWidget):
             self._line_collection = sp.add_line(out, colors=_TRACE_COLOR, thickness=1.0)
 
     def _rebuild_ticks(self) -> None:
-        """Vertical tick marks for all clusters with spikes in the current window."""
-        if not self._fpl_ready or self._buf_t_arr is None:
+        """Overlay coloured waveform snippets from the live trace at each spike time.
+
+        For every spike in the current window we extract the actual raw-trace
+        segment (±_SPIKE_HALF_MS milliseconds) on each relevant channel and
+        draw it in the cluster colour on top of the grey trace.  The result
+        looks identical to phy2's trace view: the waveform shape itself is
+        coloured, not a separate tick glyph.
+        """
+        if not self._fpl_ready or self._buf_t_arr is None or self._buf_traces is None:
             return
         if self._window_spikes is None and not self._cluster_data:
             return
 
-        sp     = self._subplot
-        t_arr  = self._buf_t_arr
-        t0, t1 = float(t_arr[0]), float(t_arr[-1])
-
-        # Channel pitch for tick height
+        sp      = self._subplot
+        traces  = self._buf_traces    # (n_ch, n_s)
+        t_arr   = self._buf_t_arr     # (n_s,)
         ch_ids  = self._buf_ch_ids
-        offsets = self._channel_offsets(ch_ids)
-        if len(offsets) > 1:
-            pitch = float(np.min(np.abs(np.diff(np.sort(offsets)))))
-            pitch = max(pitch, 1.0)
-        else:
-            pitch = 40.0
-        tick_h = pitch * _TICK_HALF
+        offsets = self._channel_offsets(ch_ids)   # (n_ch,) µm
+        t0, t1  = float(t_arr[0]), float(t_arr[-1])
 
-        # Build per-cluster spike times from the window fetch
-        # Prefer window_spikes (all clusters); fall back to _cluster_data (selected only)
+        # Half-width of highlighted snippet in samples (~1 ms each side)
+        # Compute half-window in display-buffer indices so the highlight always
+        # covers ±1 ms of real time regardless of how heavily the data is
+        # downsampled.  _buf_t_arr is the actual time axis of the displayed
+        # traces, so its spacing already accounts for min-max decimation.
+        n_display = len(t_arr)
+        display_duration = float(t_arr[-1]) - float(t_arr[0])
+        dt_display = display_duration / max(n_display - 1, 1)   # seconds per display sample
+        half_win = max(1, int(0.001 / dt_display))              # indices for 1 ms
+
+        # Build per-cluster spike times
         spikes_by_cid: dict[int, np.ndarray] = {}
         if self._window_spikes is not None and len(self._window_spikes):
             ws = self._window_spikes
             for cid in np.unique(ws[:, 1]).astype(int):
-                spikes_by_cid[cid] = ws[ws[:, 1] == cid, 0].astype(np.float32)
+                spikes_by_cid[cid] = ws[ws[:, 1] == cid, 0]
         else:
             for cid, (times, _ch, _col) in self._cluster_data.items():
                 mask = (times >= t0) & (times <= t1)
-                spikes_by_cid[cid] = times[mask].astype(np.float32)
+                spikes_by_cid[cid] = times[mask]
 
-        # Selected cluster ids for highlighting
         selected = set(self._cluster_data.keys())
+        sel_list = list(self._cluster_data.keys())
 
-        # Assign a stable color per cluster using a hash so it's consistent across windows
         def _cluster_color(cid: int, selected_idx: int | None) -> tuple:
             if selected_idx is not None:
                 return _CLUSTER_COLORS[selected_idx % len(_CLUSTER_COLORS)]
-            # Muted grey-toned color for unselected clusters
             rng = np.random.default_rng(seed=abs(cid) % (2**31))
             h = rng.uniform(0, 1)
             r, g, b = colorsys.hsv_to_rgb(h, 0.7, 0.75)
             return (r, g, b, 0.7)
 
-        # Remove graphics for clusters no longer in the window
-        active = set(spikes_by_cid.keys())
-        for cid in list(self._tick_lines.keys()):
-            if cid not in active:
+        # Compute which (cid, ch) keys should exist
+        active_keys: set[tuple[int, int]] = set()
+        for cid, spike_times in spikes_by_cid.items():
+            if len(spike_times) == 0:
+                continue
+            for ch in self._channels_for_cid(cid):
+                if ch in ch_ids:
+                    active_keys.add((cid, ch))
+
+        # Remove stale graphics
+        for key in list(self._tick_lines.keys()):
+            if key not in active_keys:
                 try:
-                    sp.delete_graphic(self._tick_lines.pop(cid))
+                    sp.delete_graphic(self._tick_lines.pop(key))
                 except Exception:
-                    self._tick_lines.pop(cid, None)
+                    self._tick_lines.pop(key, None)
 
-        sel_list = list(self._cluster_data.keys())
-        for cid, vis_times in spikes_by_cid.items():
-            if len(vis_times) == 0:
-                if cid in self._tick_lines:
-                    try:
-                        sp.delete_graphic(self._tick_lines.pop(cid))
-                    except Exception:
-                        self._tick_lines.pop(cid, None)
-                continue
-
-            # Look up home channel
-            home_ch = self._all_best_channels.get(cid)
-            if home_ch is None and cid in self._cluster_data:
-                home_ch = self._cluster_data[cid][1]
-            if home_ch is None:
-                continue
-
-            if home_ch in ch_ids:
-                row = ch_ids.index(home_ch)
-                y_cen = float(offsets[row])
-            elif self._ch_y is not None and home_ch < len(self._ch_y):
-                y_cen = float(self._ch_y[home_ch])
-            else:
+        for cid, spike_times in spikes_by_cid.items():
+            if len(spike_times) == 0:
                 continue
 
             sel_idx = sel_list.index(cid) if cid in selected else None
             rgba    = _cluster_color(cid, sel_idx)
             thick   = 2.5 if cid in selected else 1.5
 
-            # Remove old graphic before re-drawing
-            if cid in self._tick_lines:
-                try:
-                    sp.delete_graphic(self._tick_lines.pop(cid))
-                except Exception:
-                    self._tick_lines.pop(cid, None)
+            for ch in self._channels_for_cid(cid):
+                if ch not in ch_ids:
+                    continue
+                ch_idx = ch_ids.index(ch)
+                y_off  = float(offsets[ch_idx])
 
-            # One 2-point segment per spike (avoids NaN pen-lift issues in wgpu)
-            n = len(vis_times)
-            segs = np.empty((n, 2, 2), dtype=np.float32)
-            segs[:, 0, 0] = vis_times
-            segs[:, 0, 1] = y_cen - tick_h
-            segs[:, 1, 0] = vis_times
-            segs[:, 1, 1] = y_cen + tick_h
-            lines_list = [segs[i] for i in range(n)]
+                # Build one snippet per spike from the actual trace data
+                snippets = []
+                for t_spike in spike_times:
+                    idx = int(np.searchsorted(t_arr, t_spike))
+                    i0  = max(0, idx - half_win)
+                    i1  = min(len(t_arr), idx + half_win + 1)
+                    if i1 - i0 < 2:
+                        continue
+                    xy = np.empty((i1 - i0, 2), dtype=np.float32)
+                    xy[:, 0] = t_arr[i0:i1]
+                    xy[:, 1] = y_off + traces[ch_idx, i0:i1]
+                    snippets.append(xy)
 
-            try:
-                self._tick_lines[cid] = sp.add_line_collection(
-                    data=lines_list, colors=rgba, thickness=thick,
-                )
-            except Exception as exc:
-                logger.warning("TraceWidget: add_line_collection failed for ticks: %s", exc)
-                tick_data = np.full((n * 3, 2), np.nan, dtype=np.float32)
-                tick_data[0::3, 0] = vis_times
-                tick_data[0::3, 1] = y_cen - tick_h
-                tick_data[1::3, 0] = vis_times
-                tick_data[1::3, 1] = y_cen + tick_h
+                if not snippets:
+                    continue
+
+                key = (cid, ch)
+                # Replace existing graphic
+                if key in self._tick_lines:
+                    try:
+                        sp.delete_graphic(self._tick_lines.pop(key))
+                    except Exception:
+                        self._tick_lines.pop(key, None)
+
                 try:
-                    self._tick_lines[cid] = sp.add_line(
-                        tick_data, colors=rgba, thickness=thick
+                    self._tick_lines[key] = sp.add_line_collection(
+                        data=snippets, colors=rgba, thickness=thick,
                     )
-                except Exception as exc2:
-                    logger.warning("TraceWidget: tick fallback also failed: %s", exc2)
+                except Exception as exc:
+                    logger.warning("TraceWidget: spike highlight failed: %s", exc)
+
+    def _channels_for_cid(self, cid: int) -> list[int]:
+        """Return the channels to draw ticks on for a cluster."""
+        if cid in self._cluster_data:
+            chs = self._cluster_data[cid][1]   # list of channels (selected cluster)
+            return chs if isinstance(chs, list) else [chs]
+        # Unselected cluster: use pre-loaded top-N channels
+        best = self._all_best_channels.get(cid)
+        if best is None:
+            return []
+        return best if isinstance(best, list) else [best]
 
     def _fit_camera(self) -> None:
         """Fit camera to current traces — called after each data reload."""
@@ -590,6 +607,17 @@ class TraceWidget(QWidget):
                     self._fig.canvas.request_draw()
                 except Exception as exc:
                     logger.debug("amp zoom redraw: %s", exc)
+
+    def _reset_zoom(self) -> None:
+        """Double-click: restore pre-box-zoom state, or fit camera to current data."""
+        pre = getattr(self._box_zoom_filter, "_pre_zoom_state", None)
+        if pre is not None:
+            self._t_start  = pre["t_start"]
+            self._window_s = pre["window_s"]
+            self._box_zoom_filter._pre_zoom_state = None
+            self._schedule_fetch()
+        else:
+            self._fit_camera()
 
     def _on_filter_toggled(self, checked: bool) -> None:
         self._filtered = checked
@@ -703,3 +731,134 @@ class _TraceEventFilter(QObject):
                 return True
 
         return False
+
+
+# ---------------------------------------------------------------------------
+# Box-zoom event filter: left-drag draws rubber band, release zooms,
+# double-click restores previous view.
+# ---------------------------------------------------------------------------
+
+class _BoxZoomFilter(QObject):
+    _MIN_DRAG_PX = 8   # ignore tiny accidental drags
+
+    def __init__(self, widget: "TraceWidget", canvas: QWidget, parent=None):
+        super().__init__(parent)
+        self._w      = widget
+        self._canvas = canvas
+        self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, canvas)
+        self._origin: QPoint | None = None
+        self._pre_zoom_state: dict | None = None
+
+    def _over_canvas(self, obj) -> bool:
+        w = obj
+        while w is not None:
+            if w is self._canvas:
+                return True
+            w = w.parent()
+        return False
+
+    def eventFilter(self, obj, event) -> bool:
+        if not self._over_canvas(obj):
+            return False
+
+        t = event.type()
+
+        if t == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._origin = event.pos()
+                self._rubber.setGeometry(QRect(self._origin, self._origin))
+                self._rubber.show()
+                return True
+
+        elif t == QEvent.Type.MouseMove:
+            if self._origin is not None:
+                self._rubber.setGeometry(
+                    QRect(self._origin, event.pos()).normalized()
+                )
+                return True
+
+        elif t == QEvent.Type.MouseButtonRelease:
+            if self._origin is not None and event.button() == Qt.MouseButton.LeftButton:
+                self._rubber.hide()
+                rect = QRect(self._origin, event.pos()).normalized()
+                self._origin = None
+                if rect.width() > self._MIN_DRAG_PX and rect.height() > self._MIN_DRAG_PX:
+                    self._apply_zoom(rect)
+                return True
+
+        elif t == QEvent.Type.MouseButtonDblClick:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._origin = None
+                self._rubber.hide()
+                self._w._reset_zoom()
+                return True
+
+        return False
+
+    def _pixel_to_data(self, px: int, py: int) -> tuple[float, float]:
+        """Convert canvas pixel (px, py) → data (time_s, y_µm)."""
+        try:
+            state = self._w._subplot.camera.get_state()
+            cx = float(state["position"][0])
+            cy = float(state["position"][1])
+            dw = float(state["width"])
+            dh = float(state["height"])
+            W  = self._canvas.width()
+            H  = self._canvas.height()
+            if W <= 0 or H <= 0:
+                return 0.0, 0.0
+            t = cx + (px / W - 0.5) * dw
+            y = cy + (0.5 - py / H) * dh   # screen y is flipped vs data y
+            return t, y
+        except Exception:
+            return 0.0, 0.0
+
+    def _apply_zoom(self, rect: QRect) -> None:
+        t0, y1 = self._pixel_to_data(rect.left(),  rect.top())
+        t1, y0 = self._pixel_to_data(rect.right(), rect.bottom())
+
+        t0 = max(0.0, t0)
+        t1 = max(t0 + 0.001, t1)
+
+        # Save state so double-click can restore
+        self._pre_zoom_state = {
+            "t_start":  self._w._t_start,
+            "window_s": self._w._window_s,
+            "y_mid":    (y0 + y1) / 2.0,
+            "y_height": abs(y1 - y0) * 1.05,
+        }
+
+        # Update time window → triggers fetch + full re-render
+        self._w._t_start  = t0
+        self._w._window_s = t1 - t0
+        self._w._schedule_fetch()
+
+        # Immediately narrow camera y to the selected band
+        self._apply_y_zoom(self._pre_zoom_state["y_mid"],
+                           self._pre_zoom_state["y_height"])
+
+    def _apply_y_zoom(self, mid_y: float, h: float) -> None:
+        try:
+            sp    = self._w._subplot
+            state = sp.camera.get_state()
+            # X range from the actual fetched data (updated after each fetch)
+            t_arr = self._w._buf_t_arr
+            if t_arr is not None and len(t_arr) > 1:
+                t0, t1 = float(t_arr[0]), float(t_arr[-1])
+                mid_x  = (t0 + t1) / 2.0
+                w      = (t1 - t0) * 1.04
+            else:
+                mid_x = state["position"][0]
+                w     = state["width"]
+            sp.camera.set_state({
+                "position":        np.array([mid_x, mid_y, state["position"][2]]),
+                "fov":             0.0,
+                "width":           w,
+                "height":          h,
+                "depth":           state["depth"],
+                "zoom":            1.0,
+                "maintain_aspect": False,
+            })
+            self._w._fig.canvas.request_draw()
+        except Exception as exc:
+            logger.debug("BoxZoom: camera set failed: %s", exc)
